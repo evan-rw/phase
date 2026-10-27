@@ -3469,8 +3469,10 @@ fn trigger_source_ids_for_zone(state: &GameState, zone: Zone) -> Vec<ObjectId> {
     match zone {
         // CR 702.26b: Phased-out permanents don't trigger.
         Zone::Battlefield => state.battlefield_phased_in_ids(),
-        // CR 113.6 + CR 113.6b: a card's triggered abilities function in a
-        // graveyard or in exile only when they say so (`trigger_zones`). A card
+        // CR 113.6 + CR 113.6b + CR 113.6k: a card's triggered abilities
+        // function in a graveyard or in exile only when they state that zone, or
+        // when one of their trigger conditions can't trigger from the
+        // battlefield and can trigger from there (`trigger_zones`). A card
         // there is a trigger source only when one of its functioning triggers
         // (printed, or a keyword companion granted off-zone, such as Suspend's
         // per CR 702.62a) functions in `zone`. CR 800.4a: a card whose owner has
@@ -45309,9 +45311,13 @@ pub mod tests {
     /// player owns leave with them, and a triggered ability that player would
     /// control isn't put on the stack. In a three-player game OWNER loses to a
     /// state-based action (CR 704.5a), and the player-leaves sweep moves a card
-    /// from OWNER's graveyard to exile. The card's printed "When this card is
-    /// put into exile" trigger functions from exile (CR 113.6b), but it
-    /// triggers nothing. On this route the exile filter gives that result
+    /// from OWNER's graveyard to exile. The card's "When this card is put into
+    /// exile from anywhere" trigger has a graveyard-origin trigger condition,
+    /// which can't trigger from the battlefield and so functions where it can
+    /// trigger (CR 113.6k), looking back to the graveyard (CR 603.10a); the
+    /// engine matches it in the exile scan through the card's zone-change
+    /// record (its `trigger_zones` include Exile). Here it triggers nothing.
+    /// On this route the exile filter gives that result
     /// where base put the departed owner's trigger on the stack: base's exile
     /// scan listed every exiled card, and the card's own zone-change record
     /// still carried the trigger. The filter lists an exiled card only when
@@ -45344,8 +45350,9 @@ pub mod tests {
 
         /// A three-player game at SURVIVOR's precombat main phase, with OWNER at
         /// `owner_life`. OWNER's graveyard holds a card with the parser's
-        /// self-referential "is put into exile" shape: SelfRef, destination
-        /// Exile, functioning on the battlefield, in a graveyard and in exile.
+        /// self-referential "is put into exile from anywhere" shape: SelfRef, no
+        /// origin, destination Exile, functioning on the battlefield, in a
+        /// graveyard and in exile.
         /// OWNER controls a creature. SURVIVOR controls an observer with
         /// "Whenever a creature leaves the battlefield, you gain 1 life." and
         /// holds Coffin Purge.
