@@ -45277,9 +45277,11 @@ pub mod tests {
     /// triggers nothing. On this route the exile filter gives that result
     /// where base put the departed owner's trigger on the stack: base's exile
     /// scan listed every exiled card, and the card's own zone-change record
-    /// still carried the trigger. The filter lists only cards with a
-    /// functioning trigger that functions from exile, and a departed owner's
-    /// card has none, so this test fails on revert of the filter. A reach-guard
+    /// still carried the trigger. The filter lists an exiled card only when
+    /// one of its functioning triggers functions from exile, or a keyword
+    /// granted to it off-zone has a companion that does. A departed owner's
+    /// card has no functioning trigger (CR 800.4a), and this card has no
+    /// keyword, so this test fails on revert of the filter. A reach-guard
     /// shows the sweep batch is trigger-collected: a survivor's "Whenever a
     /// creature leaves the battlefield" observer fires as OWNER's creature
     /// leaves the game (CR 603.6c). The paired control exiles the same card
