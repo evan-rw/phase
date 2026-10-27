@@ -1199,6 +1199,22 @@ impl<'a> PlannerServices<'a> {
             // Mulligan as the complete legal set; neither can fail apply_as_current.
             // Skipping the clone+simulate eliminates ~2 state clones per mulligan step.
             engine::types::actions::GameAction::MulliganDecision { .. } => true,
+            // CR 608.2d + CR 701.23a: a named-choice answer from the prompt's
+            // enumerated domain, or a library search selection, is admitted by
+            // its submission guard without mutating the game; the engine decides that
+            // through the same authority `SimulationFilter` consults before its
+            // probe, so no state copy is needed. A shape it declines (a scoped
+            // search, a card name, a free-entry number, an answer given while a
+            // cast or activation is in progress) is simulated below.
+            engine::types::actions::GameAction::ChooseOption { .. }
+            | engine::types::actions::GameAction::SelectCards { .. }
+                if engine::ai_support::structurally_valid_prompt_answer(
+                    state,
+                    &candidate.action,
+                ) =>
+            {
+                true
+            }
             _ => {
                 engine::game::perf_counters::record_state_clone_for_legality();
                 let mut sim = state.clone();
@@ -2105,20 +2121,25 @@ mod tests {
     use engine::ai_support::{ActionMetadata, TacticalClass};
     use engine::game::combat::BlockRequirement;
     use engine::game::perf_counters;
+    use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+    use engine::game::turn_control;
     use engine::game::zones::create_object;
     use engine::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, Effect, ManaContribution, ManaProduction,
-        ResolvedAbility, TargetRef,
+        AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, Comparator, Effect,
+        ManaContribution, ManaProduction, NumberDistinctness, QuantityExpr, ResolvedAbility,
+        SearchSelectionConstraint, TargetFilter, TargetRef,
     };
     use engine::types::actions::{GameAction, MulliganChoice};
-    use engine::types::card_type::CoreType;
+    use engine::types::card_type::{CoreType, Supertype};
     use engine::types::counter::CounterType;
     use engine::types::game_state::{
-        CommanderDamageEntry, PendingContinuation, StackEntry, StackEntryKind, WaitingFor,
+        ActiveSearchDecisionAuthority, CastPaymentMode, CommanderDamageEntry,
+        NamedChoiceSourceBinding, PendingContinuation, PendingScopedLibrarySearch,
+        ScopedLibrarySearchPhase, StackEntry, StackEntryKind, WaitingFor,
     };
     use engine::types::identifiers::{CardId, ObjectId};
     use engine::types::keywords::WardCost;
-    use engine::types::mana::ManaColor;
+    use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
     use engine::types::phase::Phase;
     use engine::types::zones::Zone;
     use std::collections::HashMap;
@@ -2949,6 +2970,1017 @@ mod tests {
             perf_counters::snapshot().state_clone_for_legality,
             0,
             "planner_evaluation must not clone-and-apply per candidate for legality"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Prompt-answer legality gate: `candidate_is_valid` admits a named-choice
+    // answer or a library search selection through
+    // `engine::ai_support::structurally_valid_prompt_answer` instead of a state
+    // copy + simulation, and only at the `NamedChoice` / `SearchChoice`
+    // windows. Every board is reached through the real cast/play pipeline from
+    // the card's verbatim Oracle text.
+    // ------------------------------------------------------------------
+
+    const DISTANT_MELODY_ORACLE: &str =
+        "Choose a creature type. Draw a card for each permanent you control of that type.";
+    const BRAVE_THE_ELEMENTS_ORACLE: &str = "Choose a color. White creatures you control gain protection from the chosen color until end of turn.";
+    const THRIVING_GROVE_ORACLE: &str = "This land enters tapped. As it enters, choose a color other than green.\n{T}: Add {G} or one mana of the chosen color.";
+    const DEMONIC_TUTOR_ORACLE: &str =
+        "Search your library for a card, put that card into your hand, then shuffle.";
+    const CELESTIAL_REUNION_ORACLE: &str = "As an additional cost to cast this spell, you may choose a creature type and behold two creatures of that type.\nSearch your library for a creature card with mana value X or less, reveal it, put it into your hand, then shuffle. If this spell's additional cost was paid and the revealed card is the chosen type, put that card onto the battlefield instead of putting it into your hand.";
+    const CULTIVATE_ORACLE: &str = "Search your library for up to two basic land cards, reveal those cards, put one onto the battlefield tapped and the other into your hand, then shuffle.";
+
+    /// Cast `spell` for P0 (the active player, holding priority) through the
+    /// full cast pipeline and return the state parked at its first prompt; the
+    /// runner stays parked there too.
+    fn resolve_to_prompt(runner: &mut GameRunner, spell: ObjectId) -> GameState {
+        runner.state_mut().active_player = P0;
+        runner.state_mut().priority_player = P0;
+        runner.cast(spell).resolve().state().clone()
+    }
+
+    /// Distant Melody cast and resolved up to its CR 608.2d creature-type
+    /// prompt. The answer persists on the resolving spell, so the prompt is
+    /// `ExactObjectAndResolution`-bound.
+    fn distant_melody_prompt(mut scenario: GameScenario) -> GameState {
+        scenario.at_phase(Phase::PreCombatMain);
+        let mut builder = scenario.add_spell_to_hand_from_oracle(
+            P0,
+            "Distant Melody",
+            false,
+            DISTANT_MELODY_ORACLE,
+        );
+        builder.with_mana_cost(ManaCost::Cost {
+            generic: 3,
+            shards: vec![ManaCostShard::Blue],
+        });
+        let melody = builder.id();
+        let mut pool: Vec<ManaUnit> = (0..3)
+            .map(|_| ManaUnit::new(ManaType::Colorless, melody, false, vec![]))
+            .collect();
+        pool.push(ManaUnit::new(ManaType::Blue, melody, false, vec![]));
+        scenario.with_mana_pool(P0, pool);
+        let state = resolve_to_prompt(&mut scenario.build(), melody);
+        match &state.waiting_for {
+            WaitingFor::NamedChoice {
+                player,
+                choice_type: ChoiceType::CreatureType { .. },
+                options,
+                source: Some(source),
+                ..
+            } => {
+                assert_eq!(*player, P0, "P0 resolves Distant Melody");
+                assert!(
+                    options.len() > 1,
+                    "the creature-type prompt must enumerate several answers"
+                );
+                assert_eq!(
+                    source.binding,
+                    NamedChoiceSourceBinding::ExactObjectAndResolution
+                );
+            }
+            other => panic!("Distant Melody must halt on its creature-type prompt, got {other:?}"),
+        }
+        assert!(
+            !state.withholds_priority(),
+            "the prompt is answered while the spell resolves, not mid-cast"
+        );
+        state
+    }
+
+    /// Brave the Elements cast and resolved up to its CR 608.2d color prompt.
+    /// Its choice does not persist, so the prompt carries no source.
+    fn brave_the_elements_prompt() -> GameState {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let mut builder = scenario.add_spell_to_hand_from_oracle(
+            P0,
+            "Brave the Elements",
+            true,
+            BRAVE_THE_ELEMENTS_ORACLE,
+        );
+        builder.with_mana_cost(ManaCost::Cost {
+            generic: 0,
+            shards: vec![ManaCostShard::White],
+        });
+        let brave = builder.id();
+        scenario.with_mana_pool(
+            P0,
+            vec![ManaUnit::new(ManaType::White, brave, false, vec![])],
+        );
+        let state = resolve_to_prompt(&mut scenario.build(), brave);
+        assert!(
+            matches!(
+                &state.waiting_for,
+                WaitingFor::NamedChoice {
+                    player,
+                    choice_type: ChoiceType::Color { .. },
+                    source: None,
+                    ..
+                } if *player == P0
+            ),
+            "Brave the Elements must halt on its source-less color prompt, got {:?}",
+            state.waiting_for
+        );
+        assert!(!state.withholds_priority());
+        state
+    }
+
+    /// Thriving Grove played up to its CR 614.12a pre-entry color prompt: a
+    /// `PendingEntry`-bound source whose parked entry is live.
+    fn thriving_grove_prompt() -> GameState {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let grove = scenario
+            .add_land_to_hand(P0, "Thriving Grove")
+            .from_oracle_text(THRIVING_GROVE_ORACLE)
+            .id();
+        let mut runner = scenario.build();
+        runner.state_mut().active_player = P0;
+        runner.state_mut().priority_player = P0;
+        let card_id = runner.state().objects[&grove].card_id;
+        runner
+            .act(GameAction::PlayLand {
+                object_id: grove,
+                card_id,
+            })
+            .expect("playing the land must start its entry");
+        let state = runner.state().clone();
+        assert!(
+            matches!(
+                &state.waiting_for,
+                WaitingFor::NamedChoice {
+                    player,
+                    choice_type: ChoiceType::Color { .. },
+                    source: Some(source),
+                    ..
+                } if *player == P0
+                    && source.binding == NamedChoiceSourceBinding::PendingEntry
+                    && source.has_matching_context()
+            ),
+            "Thriving Grove must halt on its pre-entry color prompt, got {:?}",
+            state.waiting_for
+        );
+        assert!(
+            state.pending_replacement.is_some(),
+            "the entry is parked behind the choice"
+        );
+        assert!(!state.withholds_priority());
+        state
+    }
+
+    /// Demonic Tutor cast and resolved up to its CR 701.23a/d quantity search:
+    /// an ordinary (non-scoped) search over a four-card library that must find
+    /// exactly one card.
+    fn demonic_tutor_prompt(mut scenario: GameScenario) -> GameState {
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_library_top(P0, &["Card A", "Card B", "Card C", "Card D"]);
+        let mut builder = scenario.add_spell_to_hand_from_oracle(
+            P0,
+            "Demonic Tutor",
+            false,
+            DEMONIC_TUTOR_ORACLE,
+        );
+        builder.with_mana_cost(ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Black],
+        });
+        let tutor = builder.id();
+        scenario.with_mana_pool(
+            P0,
+            vec![
+                ManaUnit::new(ManaType::Colorless, tutor, false, vec![]),
+                ManaUnit::new(ManaType::Black, tutor, false, vec![]),
+            ],
+        );
+        let state = resolve_to_prompt(&mut scenario.build(), tutor);
+        let WaitingFor::SearchChoice {
+            player,
+            cards,
+            count,
+            up_to,
+            ..
+        } = &state.waiting_for
+        else {
+            panic!(
+                "Demonic Tutor must halt on its library search, got {:?}",
+                state.waiting_for
+            );
+        };
+        assert_eq!(*player, P0, "P0 searches");
+        assert_eq!(*count, 1, "\"a card\" is a quantity search for one card");
+        assert!(!*up_to, "the search must find exactly one card");
+        let mut pool = cards.clone();
+        pool.sort();
+        let mut library: Vec<ObjectId> = state
+            .players
+            .iter()
+            .find(|seat| seat.id == P0)
+            .expect("P0 exists")
+            .library
+            .iter()
+            .copied()
+            .collect();
+        library.sort();
+        assert_eq!(pool.len(), 4, "the pool is the four-card library");
+        assert_eq!(pool, library, "the pool is exactly P0's library");
+        assert!(
+            state.pending_scoped_library_search.is_none(),
+            "Demonic Tutor's search is an ordinary (non-scoped) search"
+        );
+        state
+    }
+
+    /// Celestial Reunion cast with its optional additional cost paid, up to the
+    /// CR 601.2b cost-time creature-type prompt (`CostTypeChoice`, not a
+    /// `NamedChoice`): P0 holds two Elf creature cards, so only "Elf" can be
+    /// beheld twice (CR 701.4a).
+    fn celestial_reunion_cost_type_prompt() -> GameState {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        for name in ["Elf A", "Elf B"] {
+            scenario
+                .add_creature_to_hand(P0, name, 1, 1)
+                .with_subtypes(vec!["Elf"]);
+        }
+        let mut builder = scenario.add_spell_to_hand_from_oracle(
+            P0,
+            "Celestial Reunion",
+            false,
+            CELESTIAL_REUNION_ORACLE,
+        );
+        builder.with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Green],
+            generic: 0,
+        });
+        let reunion = builder.id();
+        scenario.with_mana_pool(
+            P0,
+            (0..4)
+                .map(|_| ManaUnit::new(ManaType::Green, reunion, false, vec![]))
+                .collect(),
+        );
+        let mut runner = scenario.build();
+        runner.state_mut().all_creature_types = vec!["Elf".to_string(), "Goblin".to_string()];
+        runner.state_mut().active_player = P0;
+        runner.state_mut().priority_player = P0;
+        let card_id = runner.state().objects[&reunion].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: reunion,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("casting Celestial Reunion must be accepted");
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::OptionalCostChoice { .. }
+            ),
+            "the caster must be asked whether to pay the optional additional cost, got {:?}",
+            runner.state().waiting_for
+        );
+        runner
+            .act(GameAction::DecideOptionalCost { pay: true })
+            .expect("paying the behold cost must be accepted");
+        let state = runner.state().clone();
+        match &state.waiting_for {
+            WaitingFor::CostTypeChoice {
+                player,
+                choice_type,
+                options,
+                ..
+            } => {
+                assert_eq!(*player, P0, "P0 announces the cost");
+                assert!(matches!(choice_type, ChoiceType::CreatureType { .. }));
+                assert_eq!(*options, ["Elf"], "only Elf can be beheld");
+            }
+            other => panic!("Celestial Reunion must halt on its cost-type prompt, got {other:?}"),
+        }
+        assert!(
+            state.withholds_priority(),
+            "the cost-type prompt is answered mid-cast"
+        );
+        state
+    }
+
+    /// Cultivate cast and resolved through its library search (both basics
+    /// found) up to the split-destination partition prompt
+    /// (`SearchPartitionChoice`, answered with `SelectCards` but not a
+    /// `SearchChoice`): CR 701.23a + CR 608.2d.
+    fn cultivate_partition_prompt() -> GameState {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let forest = scenario
+            .add_land_to_library_top(P0, "Forest")
+            .with_subtypes(vec!["Forest"])
+            .id();
+        let mountain = scenario
+            .add_land_to_library_top(P0, "Mountain")
+            .with_subtypes(vec!["Mountain"])
+            .id();
+        let mut builder =
+            scenario.add_spell_to_hand_from_oracle(P0, "Cultivate", false, CULTIVATE_ORACLE);
+        builder.with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 2,
+        });
+        let cultivate = builder.id();
+        scenario.with_mana_pool(
+            P0,
+            vec![
+                ManaUnit::new(ManaType::Green, cultivate, false, vec![]),
+                ManaUnit::new(ManaType::Colorless, cultivate, false, vec![]),
+                ManaUnit::new(ManaType::Colorless, cultivate, false, vec![]),
+            ],
+        );
+        let mut runner = scenario.build();
+        // Both library lands are basic (the scenario builder offers no
+        // supertype setter, and its state is private outside the engine).
+        for land in [forest, mountain] {
+            let obj = runner
+                .state_mut()
+                .objects
+                .get_mut(&land)
+                .expect("the land was staged");
+            obj.card_types.supertypes.push(Supertype::Basic);
+            obj.base_card_types = obj.card_types.clone();
+        }
+        let searching = resolve_to_prompt(&mut runner, cultivate);
+        match &searching.waiting_for {
+            WaitingFor::SearchChoice {
+                player,
+                cards,
+                count,
+                up_to,
+                ..
+            } => {
+                assert_eq!(*player, P0, "P0 searches");
+                assert_eq!(*count, 2);
+                assert!(*up_to, "\"up to two\"");
+                assert!(cards.contains(&forest) && cards.contains(&mountain));
+            }
+            other => panic!("Cultivate must halt on its library search, got {other:?}"),
+        }
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![forest, mountain],
+            })
+            .expect("finding both basics must park the partition choice");
+        let state = runner.state().clone();
+        match &state.waiting_for {
+            WaitingFor::SearchPartitionChoice {
+                player,
+                cards,
+                primary_destination,
+                primary_count,
+                rest_destination,
+                ..
+            } => {
+                assert_eq!(*player, P0, "P0 partitions the found cards");
+                assert_eq!(*primary_count, 1);
+                assert_eq!(*primary_destination, Zone::Battlefield);
+                assert_eq!(*rest_destination, Zone::Hand);
+                let mut found = cards.clone();
+                found.sort();
+                let mut expected = [forest, mountain];
+                expected.sort();
+                assert_eq!(found, expected, "the found set is both basics");
+            }
+            other => panic!("Cultivate must halt on its partition prompt, got {other:?}"),
+        }
+        assert!(state.pending_scoped_library_search.is_none());
+        state
+    }
+
+    fn choose(choice: &str) -> GameAction {
+        GameAction::ChooseOption {
+            choice: choice.to_string(),
+        }
+    }
+
+    fn select(cards: &[ObjectId]) -> GameAction {
+        GameAction::SelectCards {
+            cards: cards.to_vec(),
+        }
+    }
+
+    fn named_options(state: &GameState) -> Vec<String> {
+        match &state.waiting_for {
+            WaitingFor::NamedChoice { options, .. } => options.clone(),
+            other => panic!("expected a NamedChoice prompt, got {other:?}"),
+        }
+    }
+
+    fn search_pool(state: &GameState) -> Vec<ObjectId> {
+        match &state.waiting_for {
+            WaitingFor::SearchChoice { cards, .. } => cards.clone(),
+            other => panic!("expected a SearchChoice prompt, got {other:?}"),
+        }
+    }
+
+    fn object_named(state: &GameState, name: &str) -> ObjectId {
+        state
+            .objects
+            .values()
+            .find(|object| object.name == name)
+            .map(|object| object.id)
+            .unwrap_or_else(|| panic!("no object named {name}"))
+    }
+
+    /// The same board with a scoped ("each player searches") library search
+    /// pending, in the acceptance phase — the shape the structural authority
+    /// defers to the simulation.
+    fn with_scoped_search_flag(state: &GameState) -> GameState {
+        let mut scoped = state.clone();
+        let tutor = object_named(state, "Demonic Tutor");
+        scoped.pending_scoped_library_search = Some(PendingScopedLibrarySearch {
+            ability: Box::new(ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                tutor,
+                P0,
+            )),
+            phase: ScopedLibrarySearchPhase::CollectAcceptance {
+                remaining_players: Vec::new(),
+                accepted_players: Vec::new(),
+                acceptance_authorities: Vec::new(),
+                current_player: None,
+            },
+            after_scope: None,
+        });
+        scoped
+    }
+
+    /// The legality gate's simulation arm verbatim: one state copy,
+    /// `apply_as_current_for_simulation`.
+    fn planner_simulation_accepts(state: &GameState, action: &GameAction) -> bool {
+        let mut sim = state.clone();
+        apply_as_current_for_simulation(&mut sim, action.clone()).is_ok()
+    }
+
+    /// `PlannerServices::candidate_is_valid` on `action`: its verdict and the
+    /// legality state copies it recorded.
+    fn gate_verdict(state: &GameState, action: &GameAction) -> (bool, u64) {
+        let candidate = CandidateAction {
+            action: action.clone(),
+            metadata: ActionMetadata::for_actor(
+                state.waiting_for.acting_player(),
+                TacticalClass::Selection,
+            ),
+        };
+        perf_counters::reset();
+        let verdict = PlannerServices::candidate_is_valid(state, &candidate);
+        (verdict, perf_counters::snapshot().state_clone_for_legality)
+    }
+
+    /// How the legality gate must decide an answer.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Route {
+        /// Admitted by `structurally_valid_prompt_answer`: no state copy.
+        Structural,
+        /// Declined by the authority and simulated: at least one state copy.
+        Simulated,
+    }
+
+    /// One agreement row: an answer on a board, the route the gate must take,
+    /// and the verdict derived from the card text and the rules.
+    struct GateRow {
+        label: String,
+        state: GameState,
+        action: GameAction,
+        route: Route,
+        derived: bool,
+        /// CR 723.5: the submitter a multi-authority board must derive.
+        submitter: Option<PlayerId>,
+    }
+
+    fn gate_row(
+        label: impl Into<String>,
+        state: &GameState,
+        action: GameAction,
+        route: Route,
+        derived: bool,
+    ) -> GateRow {
+        GateRow {
+            label: label.into(),
+            state: state.clone(),
+            action,
+            route,
+            derived,
+            submitter: None,
+        }
+    }
+
+    /// T1. Every creature-type answer at Distant Melody's resolution prompt
+    /// passes the planner legality gate, composed as production composes it
+    /// (`score_candidates_core_for_root`: decision context →
+    /// `prepare_payment_candidates` → `validate_prepared_candidates`), without
+    /// a state copy, and every answer is retained.
+    ///
+    /// Fails on revert of the `candidate_is_valid` prompt-answer arm: each
+    /// answer is then simulated (one legality clone per answer).
+    #[test]
+    fn named_choice_answers_pass_the_legality_gate_without_a_state_copy() {
+        let state = distant_melody_prompt(GameScenario::new());
+        let options = named_options(&state);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = PolicyRegistry::default();
+        let mut services = PlannerServices::new_default(P0, &config, &policies);
+        let ctx = services.build_decision_context(&state);
+        let prepared = prepare_payment_candidates(&state, ctx.candidates.clone());
+
+        // Reach guard: one `ChooseOption` per option, and none carries a
+        // payment successor (which would bypass `candidate_is_valid`).
+        assert_eq!(
+            prepared.len(),
+            options.len(),
+            "one prepared candidate per option"
+        );
+        for entry in &prepared {
+            assert!(
+                matches!(entry.candidate.action, GameAction::ChooseOption { .. }),
+                "unexpected candidate {:?}",
+                entry.candidate.action
+            );
+            assert!(entry.payment_successor.is_none());
+        }
+
+        perf_counters::reset();
+        let validated = services.validate_prepared_candidates(&state, prepared.clone());
+        let clones = perf_counters::snapshot().state_clone_for_legality;
+        assert_eq!(
+            clones, 0,
+            "named-choice answers must pass the legality gate without a state copy"
+        );
+
+        let issued: Vec<GameAction> = prepared
+            .iter()
+            .map(|entry| entry.candidate.action.clone())
+            .collect();
+        let retained: Vec<GameAction> = validated
+            .iter()
+            .map(|entry| entry.candidate.action.clone())
+            .collect();
+        assert_eq!(
+            retained, issued,
+            "the gate must retain every answer, in order"
+        );
+        for action in &issued {
+            assert!(
+                planner_simulation_accepts(&state, action),
+                "the planner's simulation accepts {action:?}"
+            );
+        }
+
+        // Paired reach guard: on the same board an answer outside the domain is
+        // declined by the authority and simulated, so the counter is live.
+        let (verdict, clones) = gate_verdict(&state, &choose("Not A Creature Type"));
+        assert!(!verdict, "a non-creature-type answer is illegal");
+        assert!(
+            clones >= 1,
+            "an answer the authority declines must be simulated"
+        );
+    }
+
+    /// T2. Every selection at Demonic Tutor's library search passes the
+    /// planner legality gate, composed as production composes it, without a
+    /// state copy, and every selection is retained.
+    ///
+    /// Fails on revert of the `candidate_is_valid` prompt-answer arm: each
+    /// selection is then simulated (one legality clone per selection).
+    #[test]
+    fn search_selections_pass_the_legality_gate_without_a_state_copy() {
+        let state = demonic_tutor_prompt(GameScenario::new());
+        let pool = search_pool(&state);
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = PolicyRegistry::default();
+        let mut services = PlannerServices::new_default(P0, &config, &policies);
+        let ctx = services.build_decision_context(&state);
+        let prepared = prepare_payment_candidates(&state, ctx.candidates.clone());
+
+        // Reach guard: one `SelectCards` per library card, and none carries a
+        // payment successor (which would bypass `candidate_is_valid`).
+        assert_eq!(prepared.len(), pool.len(), "one selection per library card");
+        for entry in &prepared {
+            assert!(
+                matches!(entry.candidate.action, GameAction::SelectCards { .. }),
+                "unexpected candidate {:?}",
+                entry.candidate.action
+            );
+            assert!(entry.payment_successor.is_none());
+        }
+
+        perf_counters::reset();
+        let validated = services.validate_prepared_candidates(&state, prepared.clone());
+        let clones = perf_counters::snapshot().state_clone_for_legality;
+        assert_eq!(
+            clones, 0,
+            "search selections must pass the legality gate without a state copy"
+        );
+
+        let issued: Vec<GameAction> = prepared
+            .iter()
+            .map(|entry| entry.candidate.action.clone())
+            .collect();
+        let retained: Vec<GameAction> = validated
+            .iter()
+            .map(|entry| entry.candidate.action.clone())
+            .collect();
+        assert_eq!(
+            retained, issued,
+            "the gate must retain every selection, in order"
+        );
+        for action in &issued {
+            assert!(
+                planner_simulation_accepts(&state, action),
+                "the planner's simulation accepts {action:?}"
+            );
+        }
+
+        // Paired reach guard: the same pick on a scoped search is deferred by
+        // the authority and simulated, and keeps the simulation's verdict.
+        let scoped = with_scoped_search_flag(&state);
+        let pick = select(&pool[..1]);
+        let (verdict, clones) = gate_verdict(&scoped, &pick);
+        assert!(clones >= 1, "a scoped search selection must be simulated");
+        assert_eq!(verdict, planner_simulation_accepts(&scoped, &pick));
+        assert!(verdict, "the ordinary guard accepts a legal single pick");
+    }
+
+    /// T3. The prompt-answer arm agrees with the planner's own simulation on
+    /// every row: answers the engine authority admits (including CR 723.5
+    /// controlled-player and latched-search-controller boards, where someone
+    /// other than the prompted player submits) and hostile shapes it must
+    /// decline. Each row's simulation verdict also equals the reading derived
+    /// from the card text and the rules.
+    ///
+    /// The two scope rows answer `ChooseOption` at Celestial Reunion's
+    /// `CostTypeChoice` and `SelectCards` at Cultivate's
+    /// `SearchPartitionChoice` — windows other than `NamedChoice` /
+    /// `SearchChoice`. They fail if `structurally_valid_prompt_answer`'s window
+    /// set widens, because the planner would then admit them without a state
+    /// copy.
+    #[test]
+    fn prompt_answer_gate_agrees_with_the_planner_simulation() {
+        use Route::{Simulated, Structural};
+
+        let mut rows: Vec<GateRow> = Vec::new();
+
+        // CR 608.2d + CR 205.3m: every offered creature type is a legal answer.
+        let melody = distant_melody_prompt(GameScenario::new());
+        let melody_options = named_options(&melody);
+        for option in &melody_options {
+            rows.push(gate_row(
+                format!("melody/each {option}"),
+                &melody,
+                choose(option),
+                Structural,
+                true,
+            ));
+        }
+
+        let brave = brave_the_elements_prompt();
+        for option in named_options(&brave) {
+            rows.push(gate_row(
+                format!("brave/each {option}"),
+                &brave,
+                choose(&option),
+                Structural,
+                true,
+            ));
+        }
+
+        // CR 614.12a: every offered color answers the parked entry.
+        let grove = thriving_grove_prompt();
+        let grove_options = named_options(&grove);
+        for option in &grove_options {
+            rows.push(gate_row(
+                format!("grove/each {option}"),
+                &grove,
+                choose(option),
+                Structural,
+                true,
+            ));
+        }
+
+        // CR 701.23a + CR 701.23d: each single library card is a legal find.
+        let tutor = demonic_tutor_prompt(GameScenario::new());
+        let pool = search_pool(&tutor);
+        for &card in &pool {
+            rows.push(gate_row(
+                format!("tutor/each {card:?}"),
+                &tutor,
+                select(&[card]),
+                Structural,
+                true,
+            ));
+        }
+
+        // CR 701.23b/d: an "up to" search may find none.
+        let mut up_to_board = tutor.clone();
+        let WaitingFor::SearchChoice { up_to, .. } = &mut up_to_board.waiting_for else {
+            unreachable!("the fixture asserts the search prompt");
+        };
+        *up_to = true;
+        rows.push(gate_row(
+            "tutor/up-to-empty",
+            &up_to_board,
+            select(&[]),
+            Structural,
+            true,
+        ));
+
+        // CR 701.23a: two distinct cards found by a two-card search.
+        let mut count_two = tutor.clone();
+        let WaitingFor::SearchChoice { count, .. } = &mut count_two.waiting_for else {
+            unreachable!("the fixture asserts the search prompt");
+        };
+        *count = 2;
+        rows.push(gate_row(
+            "tutor/count2-distinct",
+            &count_two,
+            select(&pool[..2]),
+            Structural,
+            true,
+        ));
+
+        // CR 723.5: under player control the controller submits; legality is
+        // unchanged.
+        let mut controlled_2p = melody.clone();
+        controlled_2p.turn_decision_controller = Some(P1);
+        for option in melody_options.iter().take(3) {
+            rows.push(GateRow {
+                submitter: Some(P1),
+                ..gate_row(
+                    format!("melody/controlled-2p {option}"),
+                    &controlled_2p,
+                    choose(option),
+                    Structural,
+                    true,
+                )
+            });
+        }
+
+        let mut controlled_3p = distant_melody_prompt(GameScenario::new_n_player(3, 42));
+        controlled_3p.turn_decision_controller = Some(PlayerId(2));
+        for option in named_options(&controlled_3p).iter().take(3) {
+            rows.push(GateRow {
+                submitter: Some(PlayerId(2)),
+                ..gate_row(
+                    format!("melody/controlled-3p {option}"),
+                    &controlled_3p,
+                    choose(option),
+                    Structural,
+                    true,
+                )
+            });
+        }
+
+        // CR 723.5: the controller makes the controlled player's choices; here
+        // the search's latched controller (P1), not live turn control (P2),
+        // submits. Legality is unchanged.
+        let mut latched_3p = demonic_tutor_prompt(GameScenario::new_n_player(3, 42));
+        latched_3p
+            .active_search_decision_controls
+            .get_mut(&P0)
+            .expect("the search latches its decision control when it starts")
+            .authority = ActiveSearchDecisionAuthority::LatchedController { controller: P1 };
+        latched_3p.turn_decision_controller = Some(PlayerId(2));
+        for &card in search_pool(&latched_3p).iter().take(2) {
+            rows.push(GateRow {
+                submitter: Some(P1),
+                ..gate_row(
+                    format!("tutor/latched-3p {card:?}"),
+                    &latched_3p,
+                    select(&[card]),
+                    Structural,
+                    true,
+                )
+            });
+        }
+
+        // Hostile named-choice rows: the authority declines, the simulation
+        // decides.
+        // CR 205.3m: not a creature type.
+        rows.push(gate_row(
+            "melody/outside-domain",
+            &melody,
+            choose("Not A Creature Type"),
+            Simulated,
+            false,
+        ));
+        // CR 201.4 + CR 107.1a/b: card names and free-entry numbers are
+        // validated by rule; a creature-type word is neither.
+        for (label, by_rule) in [
+            ("melody/card-name", ChoiceType::CardName),
+            (
+                "melody/free-entry",
+                ChoiceType::NumberRange {
+                    min: 0,
+                    max: None,
+                    distinctness: NumberDistinctness::Repeatable,
+                },
+            ),
+        ] {
+            let mut board = melody.clone();
+            let WaitingFor::NamedChoice { choice_type, .. } = &mut board.waiting_for else {
+                unreachable!("the fixture asserts the named-choice prompt");
+            };
+            *choice_type = by_rule;
+            rows.push(gate_row(
+                label,
+                &board,
+                choose(&melody_options[0]),
+                Simulated,
+                false,
+            ));
+        }
+        // CR 614.12a: with no parked entry there is nothing to answer.
+        let mut no_live_entry = grove.clone();
+        no_live_entry.pending_replacement = None;
+        rows.push(gate_row(
+            "grove/no-live-entry",
+            &no_live_entry,
+            choose(&grove_options[0]),
+            Simulated,
+            false,
+        ));
+        // A source-bound prompt without its matching context (the guard's
+        // incoherent-source refusal; not card-derived).
+        let mut no_context = grove.clone();
+        let WaitingFor::NamedChoice {
+            source: Some(source),
+            ..
+        } = &mut no_context.waiting_for
+        else {
+            unreachable!("the fixture asserts the source-bound prompt");
+        };
+        source.context = None;
+        rows.push(gate_row(
+            "grove/no-context",
+            &no_context,
+            choose(&grove_options[0]),
+            Simulated,
+            false,
+        ));
+
+        // Hostile search rows.
+        // CR 701.23d: "a card" with a non-empty library finds exactly one.
+        rows.push(gate_row(
+            "tutor/exact-empty",
+            &tutor,
+            select(&[]),
+            Simulated,
+            false,
+        ));
+        rows.push(gate_row(
+            "tutor/exact-two",
+            &tutor,
+            select(&pool[..2]),
+            Simulated,
+            false,
+        ));
+        // CR 701.23a: the found card must be in the searched library.
+        rows.push(gate_row(
+            "tutor/outside-pool",
+            &tutor,
+            select(&[object_named(&tutor, "Demonic Tutor")]),
+            Simulated,
+            false,
+        ));
+        // CR 701.23a: one card cannot be found twice.
+        rows.push(gate_row(
+            "tutor/duplicate",
+            &count_two,
+            select(&[pool[0], pool[0]]),
+            Simulated,
+            false,
+        ));
+        // CR 608.2c: a total mana value below zero is impossible.
+        let mut constrained = tutor.clone();
+        let WaitingFor::SearchChoice { constraint, .. } = &mut constrained.waiting_for else {
+            unreachable!("the fixture asserts the search prompt");
+        };
+        *constraint = SearchSelectionConstraint::TotalManaValue {
+            comparator: Comparator::LT,
+            value: 0,
+        };
+        rows.push(gate_row(
+            "tutor/constraint",
+            &constrained,
+            select(&pool[..1]),
+            Simulated,
+            false,
+        ));
+        // Routing row (not card-derived): a scoped search is deferred, and the
+        // ordinary guard then accepts a legal single pick.
+        rows.push(gate_row(
+            "tutor/scoped",
+            &with_scoped_search_flag(&tutor),
+            select(&pool[..1]),
+            Simulated,
+            true,
+        ));
+
+        // Scope rows: the same two actions at other windows keep the
+        // simulation.
+        // CR 601.2b + CR 701.4a: P0 can behold two Elves, so "Elf" is legal.
+        rows.push(gate_row(
+            "reunion/cost-type-choice",
+            &celestial_reunion_cost_type_prompt(),
+            choose("Elf"),
+            Simulated,
+            true,
+        ));
+        // CR 701.23a + CR 608.2d: either found basic is a legal "one".
+        let partition = cultivate_partition_prompt();
+        let WaitingFor::SearchPartitionChoice { cards: found, .. } = &partition.waiting_for else {
+            unreachable!("the fixture asserts the partition prompt");
+        };
+        for &card in found {
+            rows.push(gate_row(
+                format!("cultivate/partition-each {card:?}"),
+                &partition,
+                select(&[card]),
+                Simulated,
+                true,
+            ));
+        }
+
+        assert!(
+            rows.iter().any(|row| row.route == Structural)
+                && rows.iter().any(|row| row.route == Simulated),
+            "the table must pair structural rows with simulated controls"
+        );
+
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = PolicyRegistry::default();
+        let mut services = PlannerServices::new_default(P0, &config, &policies);
+        let mut scope_rows = 0;
+        for row in &rows {
+            let label = &row.label;
+            let reference = planner_simulation_accepts(&row.state, &row.action);
+            assert_eq!(
+                reference, row.derived,
+                "{label}: the planner's simulation must match the derived reading"
+            );
+            let (verdict, clones) = gate_verdict(&row.state, &row.action);
+            assert_eq!(
+                verdict, reference,
+                "{label}: the gate must agree with the planner's simulation"
+            );
+            match row.route {
+                Structural => assert_eq!(
+                    clones, 0,
+                    "{label}: an answer the authority admits needs no state copy"
+                ),
+                Simulated => assert!(
+                    clones >= 1,
+                    "{label}: an answer the authority declines must be simulated"
+                ),
+            }
+            if let Some(submitter) = row.submitter {
+                assert_eq!(
+                    turn_control::authorized_submitter(&row.state),
+                    Some(submitter),
+                    "{label}: the board must derive the controlling submitter"
+                );
+                assert_ne!(
+                    row.state.waiting_for.acting_player(),
+                    Some(submitter),
+                    "{label}: the submitter must differ from the prompted player"
+                );
+            }
+            if !matches!(
+                row.state.waiting_for,
+                WaitingFor::NamedChoice { .. } | WaitingFor::SearchChoice { .. }
+            ) {
+                // Production reach for a scope row: the engine issues this
+                // answer and it carries no payment successor, so the planner
+                // decides it in `candidate_is_valid`.
+                let ctx = services.build_decision_context(&row.state);
+                let prepared = prepare_payment_candidates(&row.state, ctx.candidates.clone());
+                let entry = prepared
+                    .iter()
+                    .find(|entry| entry.candidate.action == row.action)
+                    .unwrap_or_else(|| panic!("{label}: the engine must issue {:?}", row.action));
+                assert!(
+                    entry.payment_successor.is_none(),
+                    "{label}: the answer must reach `candidate_is_valid`"
+                );
+                scope_rows += 1;
+            }
+        }
+        assert_eq!(
+            scope_rows,
+            1 + found.len(),
+            "both scope boards must be exercised"
         );
     }
 

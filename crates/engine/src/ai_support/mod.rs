@@ -333,6 +333,31 @@ pub(crate) fn structurally_valid_named_choice_answer(
     }
 }
 
+/// CR 608.2d + CR 614.12a + CR 701.23a: Whether `action` answers the pending
+/// prompt in a shape whose submission guard decides it without mutating the game:
+/// a library search selection ([`structurally_valid_search_selection`]) or a
+/// named choice from the prompt's enumerated domain
+/// ([`structurally_valid_named_choice_answer`]).
+///
+/// This is the one authority for those shapes. `SimulationFilter` consults it
+/// before its clone-and-apply probe, and phase-ai's planner legality gate
+/// consults it outside the filter pipeline, so the verdict reads only the
+/// state and the action — never a candidate's actor or semantic owner, nor a
+/// cast probe. CR 723.5: under player control, or a latched search control,
+/// the controller submits the controlled player's answer; who submits it does
+/// not change whether the guard admits it.
+///
+/// Only prompt-answer shapes with that property belong here. The other
+/// `SimulationFilter` hatches (pass, convoke payment, priority activation and
+/// cast) are scoped to that filter's own probe, and the planner keeps
+/// simulating those candidates.
+///
+/// Conservative by design: `false` only costs a simulation.
+pub fn structurally_valid_prompt_answer(state: &GameState, action: &GameAction) -> bool {
+    structurally_valid_search_selection(state, action)
+        || structurally_valid_named_choice_answer(state, action)
+}
+
 fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
     // Ready intentionally has no current acting player, but an active consent
     // grantor may still revoke. The candidate pipeline retains the frozen actor

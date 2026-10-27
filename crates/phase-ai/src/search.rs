@@ -468,11 +468,11 @@ fn choose_action_with_session_inner(
 
     // CR 608.2c + CR 701.23: SearchChoice picks have their own dedicated
     // beam-bounded scorer in `deterministic_choice`. Routing them through
-    // `score_candidates` first would force `validate_candidates` to clone
-    // state and re-apply every legal SelectCards combination — for a
-    // multi-card tutor against a large library that is hundreds of state
-    // clones (already capped engine-side, but still wasteful relative to
-    // the dedicated scorer). The deterministic path returns the chosen
+    // `score_candidates` first would run the planner's full tactical scoring
+    // over every legal SelectCards combination (and simulate each selection
+    // `structurally_valid_prompt_answer` defers, such as a scoped search's) —
+    // wasteful relative to the dedicated scorer. The deterministic path
+    // returns the chosen
     // SelectCards directly; only fall through if it produces nothing.
     if matches!(state.waiting_for, WaitingFor::SearchChoice { .. }) {
         if let Ok(mut pending) = session.prospective_fetch_prompt.write() {
