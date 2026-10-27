@@ -3474,7 +3474,8 @@ fn trigger_source_ids_for_zone(state: &GameState, zone: Zone) -> Vec<ObjectId> {
         // there is a trigger source only when one of its functioning triggers
         // (printed, or a keyword companion granted off-zone, such as Suspend's
         // per CR 702.62a) functions in `zone`. CR 800.4a: a card whose owner has
-        // left the game has no functioning trigger.
+        // left the game has no functioning trigger, though the keyword-grant
+        // check in `source_has_trigger_in_zone` does not read the owner.
         Zone::Graveyard | Zone::Exile => {
             crate::game::off_zone_characteristics::with_off_zone_keyword_scope(state, || {
                 super::targeting::zone_object_ids(state, zone)
@@ -45269,107 +45270,194 @@ pub mod tests {
 
     /// CR 800.4a + CR 800.4d: when a player leaves the game, the cards that
     /// player owns leave with them, and a triggered ability that player would
-    /// control isn't put on the stack. A card in the departing player's
-    /// graveyard with a printed "When this card is put into exile" trigger,
-    /// which functions from exile (CR 113.6b), therefore triggers nothing as
-    /// the player-leaves sweep moves it to exile. The paired control moves the
-    /// same card from graveyard to exile while its owner is still in the game,
-    /// and that trigger fires. A preservation row: the result is the same
-    /// without the exile trigger-source filter.
+    /// control isn't put on the stack. In a three-player game OWNER loses to a
+    /// state-based action (CR 704.5a), and the player-leaves sweep moves a card
+    /// from OWNER's graveyard to exile. The card's printed "When this card is
+    /// put into exile" trigger functions from exile (CR 113.6b), but it
+    /// triggers nothing. On this route the exile filter gives that result
+    /// where base put the departed owner's trigger on the stack: base's exile
+    /// scan listed every exiled card, and the card's own zone-change record
+    /// still carried the trigger. The filter lists only cards with a
+    /// functioning trigger that functions from exile, and a departed owner's
+    /// card has none, so this test fails on revert of the filter. A reach-guard
+    /// shows the sweep batch is trigger-collected: a survivor's "Whenever a
+    /// creature leaves the battlefield" observer fires as OWNER's creature
+    /// leaves the game (CR 603.6c). The paired control exiles the same card
+    /// with Coffin Purge while OWNER is still in the game, and the trigger
+    /// fires.
     #[test]
     fn departed_owners_exile_trigger_does_not_fire_as_it_leaves_the_game() {
         use crate::game::scenario::{GameRunner, GameScenario};
 
+        const SURVIVOR: PlayerId = PlayerId(0);
         const OWNER: PlayerId = PlayerId(2);
+        const COFFIN_PURGE: &str = "Exile target card from a graveyard.\n\
+            Flashback {B} (You may cast this card from your graveyard for its flashback cost. \
+            Then exile it.)";
 
-        /// A three-player game at P0's precombat main phase. OWNER's graveyard
-        /// holds a card with the parser's self-referential "is put into exile"
-        /// shape: SelfRef, destination Exile, functioning on the battlefield,
-        /// in a graveyard and in exile.
-        fn build() -> (GameRunner, ObjectId) {
-            let mut scenario = GameScenario::new_n_player(3, 42);
-            scenario.at_phase(Phase::PreCombatMain);
-            let card = scenario
-                .add_creature_to_graveyard(OWNER, "Exile-Trigger Card", 2, 2)
-                .id();
-            let mut runner = scenario.build();
-            let trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
-                .destination(Zone::Exile)
-                .valid_card(TargetFilter::SelfRef)
-                .trigger_zones(vec![Zone::Battlefield, Zone::Graveyard, Zone::Exile])
-                .execute(AbilityDefinition::new(
+        struct Board {
+            runner: GameRunner,
+            card: ObjectId,
+            departing_creature: ObjectId,
+            observer: ObjectId,
+            coffin_purge: ObjectId,
+        }
+
+        /// A three-player game at SURVIVOR's precombat main phase, with OWNER at
+        /// `owner_life`. OWNER's graveyard holds a card with the parser's
+        /// self-referential "is put into exile" shape: SelfRef, destination
+        /// Exile, functioning on the battlefield, in a graveyard and in exile.
+        /// OWNER controls a creature. SURVIVOR controls an observer with
+        /// "Whenever a creature leaves the battlefield, you gain 1 life." and
+        /// holds Coffin Purge.
+        fn build(owner_life: i32) -> Board {
+            let gain_one_life = || {
+                AbilityDefinition::new(
                     AbilityKind::Spell,
                     Effect::GainLife {
                         amount: QuantityExpr::Fixed { value: 1 },
                         player: TargetFilter::Controller,
                     },
-                ));
-            let object = runner.state_mut().objects.get_mut(&card).unwrap();
-            std::sync::Arc::make_mut(&mut object.base_trigger_definitions).push(trigger);
-            object.materialize_base_trigger_definitions();
-            (runner, card)
+                )
+            };
+            let mut scenario = GameScenario::new_n_player(3, 42);
+            scenario
+                .at_phase(Phase::PreCombatMain)
+                .with_life(OWNER, owner_life);
+            let card = scenario
+                .add_creature_to_graveyard(OWNER, "Exile-Trigger Card", 2, 2)
+                .with_trigger_definition(
+                    TriggerDefinition::new(TriggerMode::ChangesZone)
+                        .destination(Zone::Exile)
+                        .valid_card(TargetFilter::SelfRef)
+                        .trigger_zones(vec![Zone::Battlefield, Zone::Graveyard, Zone::Exile])
+                        .execute(gain_one_life()),
+                )
+                .id();
+            let departing_creature = scenario
+                .add_creature(OWNER, "Departing Creature", 2, 2)
+                .id();
+            let observer = scenario
+                .add_creature(SURVIVOR, "Leaves-the-Battlefield Observer", 1, 1)
+                .with_trigger_definition(
+                    TriggerDefinition::new(TriggerMode::LeavesBattlefield)
+                        .valid_card(TargetFilter::Typed(TypedFilter::creature()))
+                        .execute(gain_one_life()),
+                )
+                .id();
+            let coffin_purge = scenario
+                .add_spell_to_hand_from_oracle(SURVIVOR, "Coffin Purge", true, COFFIN_PURGE)
+                .with_mana_cost(ManaCost::zero())
+                .id();
+            Board {
+                runner: scenario.build(),
+                card,
+                departing_creature,
+                observer,
+                coffin_purge,
+            }
         }
 
-        /// Whether a trigger from `card` is on the stack or waiting to be put there.
-        fn has_trigger_from(state: &GameState, card: ObjectId) -> bool {
-            state.stack.iter().any(|entry| entry.source_id == card)
+        /// Whether a trigger from `source` is on the stack or waiting to be put there.
+        fn has_trigger_from(state: &GameState, source: ObjectId) -> bool {
+            state.stack.iter().any(|entry| entry.source_id == source)
                 || state
                     .pending_trigger
                     .as_ref()
-                    .is_some_and(|pending| pending.source_id == card)
+                    .is_some_and(|pending| pending.source_id == source)
                 || state
                     .deferred_triggers
                     .iter()
-                    .any(|context| context.pending.source_id == card)
+                    .any(|context| context.pending.source_id == source)
                 || state.pending_trigger_order.as_ref().is_some_and(|order| {
                     order
                         .groups
                         .iter()
                         .flat_map(|group| &group.triggers)
-                        .any(|context| context.pending.source_id == card)
+                        .any(|context| context.pending.source_id == source)
                 })
         }
 
-        // Paired positive: the owner is still in the game, and the same card
-        // moved from graveyard to exile fires its trigger.
-        let (mut runner, card) = build();
-        let state = runner.state_mut();
-        let mut events = Vec::new();
-        move_to_zone(state, card, Zone::Exile, &mut events);
-        process_triggers(state, &events);
+        /// Whether `events` hold `object`'s move from `from` to exile.
+        fn exiled_from(events: &[GameEvent], object: ObjectId, from: Zone) -> bool {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    GameEvent::ZoneChanged {
+                        object_id,
+                        from: Some(origin),
+                        to: Zone::Exile,
+                        ..
+                    } if *object_id == object && *origin == from
+                )
+            })
+        }
+
+        // Paired positive: OWNER is still in the game, and SURVIVOR's Coffin
+        // Purge exiles the same card from OWNER's graveyard. The card's exile
+        // trigger fires and resolves for OWNER.
+        let Board {
+            mut runner,
+            card,
+            coffin_purge,
+            ..
+        } = build(20);
+        let outcome = runner.cast(coffin_purge).target_object(card).resolve();
         assert!(
-            has_trigger_from(state, card),
-            "reach-guard: a graveyard-to-exile move fires the card's exile trigger"
+            exiled_from(outcome.events(), card, Zone::Graveyard),
+            "reach-guard: Coffin Purge moves the card from graveyard to exile"
         );
-        runner.advance_until_stack_empty();
         assert_eq!(
-            runner.life(OWNER),
-            21,
-            "reach-guard: the trigger resolves for its living controller"
+            outcome.life_delta(OWNER),
+            1,
+            "reach-guard: the card's exile trigger fires and resolves for its living controller"
         );
 
-        // The owner leaves the game; the sweep moves the same card to exile.
-        let (mut runner, card) = build();
+        // OWNER is at 0 life. SURVIVOR passes priority, and the game checks
+        // state-based actions before the next player receives priority
+        // (CR 704.3). OWNER loses (CR 704.5a) and leaves the game, and one
+        // sweep moves OWNER's card from graveyard to exile and OWNER's creature
+        // off the battlefield.
+        let Board {
+            mut runner,
+            card,
+            departing_creature,
+            observer,
+            ..
+        } = build(0);
         let result = runner
-            .act(GameAction::Concede { player_id: OWNER })
-            .expect("the owner concedes");
+            .act(GameAction::PassPriority)
+            .expect("SURVIVOR passes priority");
         assert!(
             result.events.iter().any(|event| matches!(
                 event,
-                GameEvent::ZoneChanged {
-                    object_id,
-                    from: Some(Zone::Graveyard),
-                    to: Zone::Exile,
-                    ..
-                } if *object_id == card
+                GameEvent::PlayerLost { player_id } if *player_id == OWNER
             )),
+            "reach-guard: OWNER loses to the state-based action"
+        );
+        assert!(
+            exiled_from(&result.events, card, Zone::Graveyard),
             "reach-guard: the player-leaves sweep moves the card from graveyard to exile"
+        );
+        assert!(
+            exiled_from(&result.events, departing_creature, Zone::Battlefield),
+            "reach-guard: the same sweep moves OWNER's creature off the battlefield"
+        );
+        assert!(
+            has_trigger_from(runner.state(), observer),
+            "reach-guard: the sweep batch is trigger-collected; SURVIVOR's observer fires \
+             as OWNER's creature leaves the game (CR 603.6c)"
         );
         assert!(
             !has_trigger_from(runner.state(), card),
             "CR 800.4d: no trigger from the departed owner's card"
         );
         runner.advance_until_stack_empty();
+        assert_eq!(
+            runner.life(SURVIVOR),
+            21,
+            "reach-guard: SURVIVOR's observer trigger resolves"
+        );
         assert!(
             !has_trigger_from(runner.state(), card),
             "CR 800.4d: no trigger from the departed owner's card after the stack drains"
