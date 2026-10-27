@@ -156,6 +156,7 @@ mod cast_cost_exile_links;
 mod cast_during_resolution_pipeline;
 mod cast_grant_mana_rider_conjunct;
 mod cast_this_way_gate_8721;
+mod cast_undo_sparse_record;
 mod cavern_hoard_dragon_cost_reduction;
 mod cda_counted_quantities_pt;
 mod celestial_kirin_cast_spell_mana_value;
