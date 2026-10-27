@@ -1,5 +1,6 @@
 //! Subprocess-level regression tests for `ai-commander`'s `--games-file` batch
-//! mode: a batch invocation's per-game output must match the single-game
+//! mode and the `--players` seat-count contract: a batch invocation's per-game
+//! output must match the single-game
 //! invocation of the same seed+difficulty, byte-for-byte outside the one
 //! inherently nondeterministic field (wall-clock elapsed time). These spawn the
 //! real `ai-commander` binary rather than calling `run()` in-process, so what is
@@ -93,6 +94,28 @@ fn normalized_result_block(game_block: &str) -> String {
     game_block[start..]
         .lines()
         .filter(|line| !line.starts_with("Elapsed:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The `P{k}` label of every per-seat row carrying `field` (`"  main="`,
+/// `"  difficulty="`, `"  life="`), in stdout order. A seat row starts with
+/// `"  P"`; `field` includes its `=`, so a deck line such as
+/// `"  Prossh…  |  … main: 99 cards"` is excluded.
+fn seat_row_labels<'a>(stdout: &'a str, field: &str) -> Vec<&'a str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("  P") && line.contains(field))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect()
+}
+
+/// `stdout` without its wall-clock lines (`elapsed=` on turn lines, the
+/// `Elapsed:` RESULT row), so two separately-timed runs compare equal.
+fn without_wall_clock_lines(stdout: &str) -> String {
+    stdout
+        .lines()
+        .filter(|line| !line.contains("elapsed=") && !line.starts_with("Elapsed:"))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -320,4 +343,139 @@ fn single_game_measurement_env_prints_measurement_marker() {
         "a single-game invocation under PHASE_AI_MEASUREMENT=1 must print the ExecutionMode: measurement marker line:
 {out}"
     );
+}
+
+/// `--players N` end to end at a non-default N on each side of four: the real
+/// binary seats exactly N players with N decks, applies a last-seat override
+/// given BEFORE `--players` (argument-order independence at the binary level),
+/// and drives every seat (no `NoEligibleAiActor` stall) through a short,
+/// action-capped game to its RESULT block.
+#[test]
+#[ignore = "loads card-data.json + runs real games; opt in via --ignored"]
+fn players_flag_seats_exactly_n_players_in_a_short_game() {
+    for players in [2u8, 5] {
+        let last_seat = players - 1;
+        let override_flag = format!("--difficulty-p{last_seat}");
+        let players_value = players.to_string();
+        let out = run_ai_commander(&[
+            override_flag.as_str(),
+            "VeryEasy",
+            "--players",
+            players_value.as_str(),
+            "--seed",
+            "9401",
+            "--difficulty",
+            "Easy",
+            "--action-cap",
+            TEST_ACTION_CAP,
+        ]);
+
+        let expected_preamble = format!(
+            "=== {players}-player Commander AI test ===\n\
+             Feed: feeds/mtggoldfish-commander.json\n\
+             Seed: 9401   Difficulty: Easy\n\n"
+        );
+        assert!(
+            out.starts_with(&expected_preamble),
+            "{players} seats: preamble must name the table size:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("Game started. {players} players.")),
+            "{players} seats: the game must start with {players} players:\n{out}"
+        );
+        let expected_labels: Vec<String> = (0..players).map(|k| format!("P{k}")).collect();
+        for field in ["  main=", "  difficulty=", "  life="] {
+            assert_eq!(
+                seat_row_labels(&out, field),
+                expected_labels,
+                "{players} seats: every {field:?} row set must cover exactly P0..P{last_seat}:\n{out}"
+            );
+        }
+        assert!(
+            out.contains(&format!("  P{last_seat}  difficulty=VeryEasy")),
+            "{players} seats: the last-seat override must reach that seat:\n{out}"
+        );
+        assert!(
+            out.contains("  P0  difficulty=Easy"),
+            "{players} seats: seats without an override keep the table difficulty:\n{out}"
+        );
+        // Panics if the RESULT block is missing; together with the seat rows
+        // above it is the reach guard for the stall assertion below.
+        normalized_result_block(&out);
+        assert!(
+            !out.contains("break_reason=NoEligibleAiActor"),
+            "{players} seats: every seat must have an AI actor:\n{out}"
+        );
+    }
+}
+
+/// `--players 4` is the default table: its output is the unflagged
+/// invocation's, line for line outside wall-clock timing, and both carry the
+/// pinned four-seat preamble.
+#[test]
+#[ignore = "loads card-data.json + runs real games; opt in via --ignored"]
+fn explicit_default_players_matches_the_unflagged_invocation() {
+    let game_args = [
+        "--seed",
+        "9201",
+        "--difficulty",
+        "Easy",
+        "--action-cap",
+        TEST_ACTION_CAP,
+    ];
+    let unflagged = run_ai_commander(&game_args);
+    let flagged_args: Vec<&str> = ["--players", "4"].into_iter().chain(game_args).collect();
+    let flagged = run_ai_commander(&flagged_args);
+
+    let expected_preamble = "=== 4-player Commander AI test ===\n\
+                             Feed: feeds/mtggoldfish-commander.json\n\
+                             Seed: 9201   Difficulty: Easy\n\n";
+    assert!(
+        unflagged.starts_with(expected_preamble),
+        "unflagged preamble changed:\n{unflagged}"
+    );
+    assert!(
+        flagged.starts_with(expected_preamble),
+        "--players 4 preamble differs from the default:\n{flagged}"
+    );
+    assert_eq!(
+        without_wall_clock_lines(&unflagged),
+        without_wall_clock_lines(&flagged)
+    );
+}
+
+/// Batch mode shares one seat count across the whole batch: with
+/// `--players 2`, every game in the games file is a two-seat game.
+#[test]
+#[ignore = "loads card-data.json + runs real games; opt in via --ignored"]
+fn players_flag_applies_to_every_game_in_a_batch() {
+    let pid = std::process::id();
+    let games_file_path =
+        std::env::temp_dir().join(format!("ai_commander_players_batch_{pid}.txt"));
+    std::fs::write(&games_file_path, "9501,Easy\n9502,Easy\n").expect("write games-file");
+    let batch = run_ai_commander(&[
+        "--players",
+        "2",
+        "--games-file",
+        games_file_path.to_str().unwrap(),
+        "--action-cap",
+        TEST_ACTION_CAP,
+    ]);
+    let _ = std::fs::remove_file(&games_file_path);
+
+    let blocks = game_blocks(&batch);
+    assert_eq!(
+        blocks.len(),
+        2,
+        "batch must print exactly one block per games-file line:\n{batch}"
+    );
+    for block in blocks {
+        assert!(
+            block.contains("Game started. 2 players."),
+            "every batch game must be a two-seat game:\n{block}"
+        );
+        assert_eq!(seat_row_labels(block, "  difficulty="), ["P0", "P1"]);
+        assert_eq!(seat_row_labels(block, "  life="), ["P0", "P1"]);
+    }
+    assert_eq!(seat_row_labels(&batch, "  main="), ["P0", "P1"]);
 }
