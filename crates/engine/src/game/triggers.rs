@@ -45517,20 +45517,26 @@ pub mod tests {
     /// player owns leave with them, and a triggered ability that player would
     /// control isn't put on the stack. In a three-player game OWNER loses to a
     /// state-based action (CR 704.5a), and the player-leaves sweep moves a card
-    /// from OWNER's graveyard to exile. The card's "When this card is put into
-    /// exile from anywhere" trigger has a graveyard-origin trigger condition,
-    /// which can't trigger from the battlefield and so functions where it can
-    /// trigger (CR 113.6k), looking back to the graveyard (CR 603.10a); the
-    /// engine matches it in the exile scan through the card's zone-change
-    /// record (its `trigger_zones` include Exile). Here it triggers nothing.
-    /// On this route the exile filter gives that result
-    /// where base put the departed owner's trigger on the stack: base's exile
-    /// scan listed every exiled card, and the card's own zone-change record
-    /// still carried the trigger. The filter lists an exiled card only when
-    /// one of its functioning triggers functions from exile, or a keyword
-    /// granted to it off-zone has a companion that does. A departed owner's
-    /// card has no functioning trigger (CR 800.4a), and this card has no
-    /// keyword, so this test fails on revert of the filter. A reach-guard
+    /// from OWNER's graveyard to exile, recording the move as a
+    /// `ZoneDeparture::LeftGame` departure. The card's "When this card is put
+    /// into exile from anywhere" trigger has a graveyard-origin trigger
+    /// condition, which can't trigger from the battlefield and so functions
+    /// where it can trigger (CR 113.6k), looking back to the graveyard
+    /// (CR 603.10a); the engine matches it in the exile scan through the card's
+    /// zone-change record (its `trigger_zones` include Exile). Here it triggers
+    /// nothing, for three independent reasons, each sufficient on its own:
+    /// `zone_change_clause_matches` (via `match_changes_zone`) lets a left-game
+    /// departure match only a battlefield-origin clause that names no
+    /// destination (CR 800.4a + CR 603.6c); the collector retires a trigger
+    /// whose controller has left the game (`retire_departed_controller_contexts`,
+    /// CR 800.4d); and the exile filter does not list the card. The filter
+    /// lists an exiled card only when one of its functioning triggers
+    /// functions from exile, or a keyword granted to it off-zone has a
+    /// companion that does; a departed owner's card has no functioning trigger
+    /// (CR 800.4a), and this card has no keyword. This test pins the outcome
+    /// through any one of them; reverting the filter alone does not fail it,
+    /// and `exile_trigger_scan_keeps_only_exile_trigger_sources`
+    /// pins the filter for a departed owner's card. A reach-guard
     /// shows the sweep batch is trigger-collected: a survivor's "Whenever a
     /// creature leaves the battlefield" observer fires as OWNER's creature
     /// leaves the game (CR 603.6c). The paired control exiles the same card
