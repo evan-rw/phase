@@ -1918,4 +1918,51 @@ mod tests {
         });
         assert_ne!(without_fold.ok(), Some(complete));
     }
+
+    /// CR 733.1: a step that removes one object and adds another, after an
+    /// earlier step's folded edit named an object absent from both sides of
+    /// it. This reaches the one-sided arms of `ObjectMap::unshared_ids` and
+    /// `ObjectMap::restricted_to`'s skip of absent ids together, and the
+    /// changed-member edits still equal the complete ones.
+    #[test]
+    fn changed_member_edits_equal_complete_edits_across_added_and_removed_objects() {
+        let (start, ids) = state_with_objects(&[(PlayerId(0), Zone::Battlefield); 3]);
+        let (gone_earlier, removed, kept) = (ids[0], ids[1], ids[2]);
+        let mut boundary = start.clone();
+        boundary
+            .objects
+            .remove(&gone_earlier)
+            .expect("fixture object");
+        let folded = cast_undo_edits(&start, &boundary, &[], cast_undo_value)
+            .expect("the earlier step records");
+        assert!(
+            names_object(&folded, gone_earlier),
+            "reach-guard: the fold names an object neither side of the next step holds"
+        );
+
+        let mut after = boundary.clone();
+        let mut moved = after.objects.remove(&removed).expect("fixture object");
+        let added = ObjectId(ids.iter().map(|id| id.0).max().expect("fixture ids") + 1);
+        moved.id = added;
+        after.objects.insert(added, moved);
+
+        let members = CastUndoMembers::changed(&boundary, &after, &folded);
+        let changed = cast_undo_edits(&boundary, &after, &folded, |side| {
+            cast_undo_projected_value(side, &members)
+        })
+        .expect("the changed-member edits build");
+        let complete = cast_undo_edits(&boundary, &after, &folded, cast_undo_value)
+            .expect("the complete edits build");
+
+        assert_eq!(changed, complete);
+        assert!(
+            names_object(&complete, removed),
+            "reach-guard: the removal is recorded"
+        );
+        assert!(
+            names_object(&complete, added),
+            "reach-guard: the addition is recorded"
+        );
+        assert!(!names_object(&complete, kept));
+    }
 }
