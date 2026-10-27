@@ -551,7 +551,7 @@ fn choose_action_with_session_inner(
         return direct(fallback_action(state, config, contract).and_then(&bind_specialist));
     }
 
-    let fast_priority = fast_priority_action(state, ai_player, config, session, Some(&contract));
+    let fast_priority = fast_priority_action(state, ai_player, config, session, Some(contract));
     // Only an absent shortcut is reusable: a present one may be filtered out or
     // followed by session writes below, so the scorer recomputes it.
     let priority_shortcut = match &fast_priority {
