@@ -176,8 +176,11 @@ enum RunContext {
 /// `cards_path` resolution, the flag loop, seat-override resolution against
 /// `--players`, and `--games-file` validation) that used to live directly in
 /// `main`, so `main` itself does nothing but read the env var, call this, and
-/// report success/failure. Never calls `std::process::exit` itself -- every error path here becomes an `Err`
-/// instead, exactly mirroring the direct-exit message each replaces.
+/// report success/failure. Error paths return an `Err` instead, exactly
+/// mirroring the direct-exit message each replaces, with two exceptions that
+/// still exit with status 1 directly: a rejected difficulty label
+/// (`--difficulty`, `--difficulty-pK`), via `parse_difficulty`, and a rejected
+/// `--action-cap` value, via `parse_action_cap`.
 fn parse_cli(args: &[String], measurement_env: bool) -> Result<CliArgs, String> {
     let mut cards_path: Option<String> = None;
 
