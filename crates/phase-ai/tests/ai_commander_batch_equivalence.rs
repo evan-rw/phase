@@ -1,7 +1,7 @@
 //! Subprocess-level regression tests for `ai-commander`'s `--games-file` batch
-//! mode and the `--players` seat-count contract: a batch invocation's per-game
-//! output must match the single-game
-//! invocation of the same seed+difficulty, byte-for-byte outside the one
+//! mode and its `--players` seat-count contract. A batch invocation's per-game
+//! output must match the single-game invocation of the same seed+difficulty,
+//! byte-for-byte outside the one
 //! inherently nondeterministic field (wall-clock elapsed time). These spawn the
 //! real `ai-commander` binary rather than calling `run()` in-process, so what is
 //! under test is the binary's actual contract with the pod-lab harness —
