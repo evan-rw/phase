@@ -2291,10 +2291,12 @@ mod tests {
     }
 
     /// A short action-capped game at a non-default seat count: every seat must
-    /// be in the AI set, hold an AI config and be tracked for elimination, or
-    /// the driver stalls on that seat's opening decision (`NoEligibleAiActor`)
-    /// or the elimination scan indexes past the table. Runs on a
-    /// `GAME_THREAD_STACK_SIZE` thread, as `main` drives games.
+    /// be in the AI set and hold an AI config, or the driver stalls on that
+    /// seat's opening decision (`NoEligibleAiActor` / `MissingAiConfig`); and
+    /// the elimination tracker must not be longer than the table, or its scan
+    /// indexes past `state.players` (the two-seat leg). No seat is eliminated
+    /// within the cap, so a tracker shorter than the table is not caught here.
+    /// Runs on a `GAME_THREAD_STACK_SIZE` thread, as `main` drives games.
     #[test]
     fn play_one_game_drives_every_seat_at_non_default_player_counts() {
         let handle = std::thread::Builder::new()
