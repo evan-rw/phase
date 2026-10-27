@@ -333,11 +333,12 @@ pub(crate) fn structurally_valid_named_choice_answer(
     }
 }
 
-/// CR 608.2d + CR 614.12a + CR 701.23a: Whether `action` answers the pending
-/// prompt in a shape whose submission guard decides it without mutating the game:
-/// a library search selection ([`structurally_valid_search_selection`]) or a
-/// named choice from the prompt's enumerated domain
-/// ([`structurally_valid_named_choice_answer`]).
+/// CR 608.2d + CR 614.12a + CR 701.23a: Whether the pending prompt's submission
+/// guard admits `action`, decided without mutating the game, for a library search
+/// selection ([`structurally_valid_search_selection`]) or a named choice from the
+/// prompt's enumerated domain ([`structurally_valid_named_choice_answer`]).
+/// `true` means the guard admits the answer; `false` means it rejects it or the
+/// shape is not modeled here.
 ///
 /// This is the one authority for those shapes. `SimulationFilter` consults it
 /// before its clone-and-apply probe, and phase-ai's planner legality gate

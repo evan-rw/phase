@@ -3862,7 +3862,7 @@ mod tests {
             Simulated,
             false,
         ));
-        // CR 608.2c: a total mana value below zero is impossible.
+        // CR 202.3 + CR 608.2c: a mana value counts the mana in a cost, so no selection's total is below zero; the printed restriction is enforced at submission.
         let mut constrained = tutor.clone();
         let WaitingFor::SearchChoice { constraint, .. } = &mut constrained.waiting_for else {
             unreachable!("the fixture asserts the search prompt");
