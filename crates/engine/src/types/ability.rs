@@ -34040,9 +34040,10 @@ impl TriggerOccurrenceState {
     /// trigger adapter below maps the returned instances to trigger entries.
     ///
     /// A producer that already holds an active generation keeps it without
-    /// drawing from the allocator, so reconciling an unchanged producer set
-    /// leaves the state equal; only a producer without one receives a fresh
-    /// generation.
+    /// drawing from the allocator; only a producer without one receives a fresh
+    /// generation. Repeating a reconcile with the same candidates therefore
+    /// leaves the state equal (the first pass may still move retained
+    /// out-of-class grants ahead of the replaced class).
     fn reconcile_grant_instances_scoped<T, F>(
         &mut self,
         candidates: Vec<(TriggerGrantProducerKey, T)>,
