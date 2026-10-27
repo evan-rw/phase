@@ -42,13 +42,15 @@ const LIBRARY_WITNESS: &str = "{T}: Add {B}. Reveal the top card of your library
 /// Serialized key of the reversal descriptor (`GameState::spell_cast_reversal`).
 const REVERSAL: &str = "spell_cast_reversal";
 
-/// Chord of Calling in the witherbloom capture, and three untapped creatures
-/// its controller can convoke with.
+/// Chord of Calling in the witherbloom capture, and three untapped green
+/// creatures its controller controls. Announced at X = 0, Chord's total cost
+/// is {G}{G}{G}, with no generic mana, so each convoker pays one {G} of its
+/// own color (CR 702.51a).
 const CHORD: ObjectId = ObjectId(31);
-const CONVOKERS: [(ObjectId, ManaType); 3] = [
-    (ObjectId(56), ManaType::Colorless),
-    (ObjectId(397), ManaType::Green),
-    (ObjectId(417), ManaType::Green),
+const CONVOKERS: [(ObjectId, ManaColor); 3] = [
+    (ObjectId(422), ManaColor::Green),
+    (ObjectId(397), ManaColor::Green),
+    (ObjectId(417), ManaColor::Green),
 ];
 
 /// Runs `action` and returns the cast-undo record counts it accrued.
@@ -303,7 +305,20 @@ fn chord_announced() -> GameRunner {
     let chord = &state.objects[&CHORD];
     assert_eq!(chord.name, "Chord of Calling");
     assert_eq!(chord.zone, Zone::Hand);
-    for (id, _) in CONVOKERS {
+    assert_eq!(
+        chord.mana_cost,
+        ManaCost::Cost {
+            shards: vec![
+                ManaCostShard::X,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            generic: 0,
+        },
+        "at X = 0 the total cost is three green pips"
+    );
+    for (id, color) in CONVOKERS {
         let creature = &state.objects[&id];
         assert_eq!(creature.zone, Zone::Battlefield, "{id:?}");
         assert!(!creature.tapped, "{id:?}");
@@ -311,6 +326,10 @@ fn chord_announced() -> GameRunner {
         assert!(
             creature.card_types.core_types.contains(&CoreType::Creature),
             "{id:?}"
+        );
+        assert!(
+            creature.color.contains(&color),
+            "{id:?} must be {color:?} to convoke the {color:?} mana it pays"
         );
     }
     assert_eq!(state.deck_pools.len(), 4);
@@ -574,19 +593,19 @@ fn an_alternative_cost_election_records_like_the_complete_record_and_cancel_refu
     ));
 }
 
-/// CR 733.1 + CR 702.51a: convoking with three creatures on a real
-/// four-player board records like the complete record at every tap, with the
-/// shared deck pools left out, and canceling untaps them.
+/// CR 733.1 + CR 702.51a: convoking Chord's three green pips with three green
+/// creatures on a real four-player board records like the complete record at
+/// every tap, with the shared deck pools left out, and canceling untaps them.
 #[test]
 fn convoke_on_a_real_four_player_board_records_like_the_complete_record() {
     let _reference = engine::game::CastUndoReferenceCheck::enable();
     let mut runner = chord_announced();
-    for (object_id, mana_type) in CONVOKERS {
+    for (object_id, color) in CONVOKERS {
         let delta = act_counted(
             &mut runner,
             GameAction::TapForConvoke {
                 object_id,
-                mana_type,
+                mana_type: ManaType::from(color),
             },
         );
         assert_recorded(delta, &format!("TapForConvoke {object_id:?}"));
@@ -612,12 +631,12 @@ fn convoke_on_a_real_four_player_board_records_like_the_complete_record() {
 #[test]
 fn a_convoke_step_serializes_only_unshared_objects_and_no_shared_deck_pool() {
     let mut runner = chord_announced();
-    let (first, first_type) = CONVOKERS[0];
+    let (first, first_color) = CONVOKERS[0];
     let delta = act_counted(
         &mut runner,
         GameAction::TapForConvoke {
             object_id: first,
-            mana_type: first_type,
+            mana_type: ManaType::from(first_color),
         },
     );
     assert_eq!(delta.values, 2, "the first convoke records");
@@ -625,12 +644,12 @@ fn a_convoke_step_serializes_only_unshared_objects_and_no_shared_deck_pool() {
     let pre = runner.state().clone();
     let folded = undo_object_ids(&pre);
     assert!(!undo_paths(&pre).is_empty(), "an earlier inverse is folded");
-    let (object_id, mana_type) = CONVOKERS[1];
+    let (object_id, color) = CONVOKERS[1];
     let delta = act_counted(
         &mut runner,
         GameAction::TapForConvoke {
             object_id,
-            mana_type,
+            mana_type: ManaType::from(color),
         },
     );
     let post = runner.state();
