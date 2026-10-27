@@ -3463,23 +3463,26 @@ fn collect_matching_triggers_inner(
 /// Lists the objects in `zone` that may be the source of a trigger at the
 /// collector's current observation boundary.
 ///
-/// The graveyard scan asks every graveyard card for its off-zone keywords
-/// against one unchanged state, so it shares one keyword gather.
+/// The graveyard and exile scans ask every card in the zone for its off-zone
+/// keywords against one unchanged state, so each shares one keyword gather.
 fn trigger_source_ids_for_zone(state: &GameState, zone: Zone) -> Vec<ObjectId> {
     match zone {
         // CR 702.26b: Phased-out permanents don't trigger.
         Zone::Battlefield => state.battlefield_phased_in_ids(),
-        Zone::Graveyard => {
+        // CR 113.6 + CR 113.6b: a card's triggered abilities function in a
+        // graveyard or in exile only when they say so (`trigger_zones`). A card
+        // there is a trigger source only when one of its functioning triggers
+        // (printed, or a keyword companion granted off-zone, such as Suspend's
+        // per CR 702.62a) functions in `zone`. CR 800.4a: a card whose owner has
+        // left the game has no functioning trigger.
+        Zone::Graveyard | Zone::Exile => {
             crate::game::off_zone_characteristics::with_off_zone_keyword_scope(state, || {
-                state
-                    .players
-                    .iter()
-                    .flat_map(|player| player.graveyard.iter().copied())
+                super::targeting::zone_object_ids(state, zone)
+                    .into_iter()
                     .filter(|id| source_has_trigger_in_zone(state, *id, zone))
                     .collect()
             })
         }
-        Zone::Exile => state.exile.iter().copied().collect(),
         Zone::Stack => state
             .stack
             .iter()
@@ -45152,6 +45155,225 @@ pub mod tests {
         assert_eq!(counts.hits, counts.matched - 1, "{counts:?}");
         assert_eq!(off_zone_keyword_scope_depth(), 0);
         assert_eq!(scanned, expected);
+    }
+
+    /// CR 113.6 + CR 113.6b: the exile trigger-source scan lists only exiled
+    /// cards with a functioning trigger that functions from exile — printed, or
+    /// a keyword companion granted off-zone (CR 702.62a) — and shares one
+    /// keyword gather, as the graveyard scan does. CR 800.4a: a card whose owner
+    /// left the game has no functioning trigger, so its exile trigger does not
+    /// list it. Fails on revert of the exile filter, which
+    /// listed every exiled card and ran no keyword query.
+    #[test]
+    fn exile_trigger_scan_keeps_only_exile_trigger_sources() {
+        use crate::game::off_zone_characteristics::{
+            off_zone_keyword_scope_counts, off_zone_keyword_scope_depth,
+            reset_off_zone_keyword_scope_counts,
+        };
+
+        let exile_trigger =
+            || TriggerDefinition::new(TriggerMode::BecomesPlotted).trigger_zones(vec![Zone::Exile]);
+        let battlefield_trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+        let graveyard_trigger =
+            TriggerDefinition::new(TriggerMode::ChangesZone).trigger_zones(vec![Zone::Graveyard]);
+
+        let mut state = setup();
+        let inert = off_zone_test_card(&mut state, 0, Zone::Exile);
+        let granted = off_zone_test_card(&mut state, 1, Zone::Exile);
+        let printed = off_zone_test_card(&mut state, 2, Zone::Exile);
+        let battlefield_only = off_zone_test_card(&mut state, 3, Zone::Exile);
+        let graveyard_only = off_zone_test_card(&mut state, 4, Zone::Exile);
+        let departed = create_object(
+            &mut state,
+            CardId(8310),
+            PlayerId(1),
+            "Departed Owner's Card".to_string(),
+            Zone::Exile,
+        );
+        for (id, definition) in [
+            (printed, exile_trigger()),
+            (battlefield_only, battlefield_trigger.clone()),
+            (graveyard_only, graveyard_trigger.clone()),
+            (departed, exile_trigger()),
+        ] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .trigger_definitions
+                .push(definition);
+        }
+        grant_off_zone_trigger_keywords(&mut state, None, Some(granted));
+        state
+            .players
+            .iter_mut()
+            .find(|player| player.id == PlayerId(1))
+            .unwrap()
+            .is_eliminated = true;
+
+        // Reach-guards: all six cards are exiled, and each exclusion is decided
+        // by the gate it names.
+        assert_eq!(
+            crate::game::targeting::zone_object_ids(&state, Zone::Exile),
+            vec![
+                inert,
+                granted,
+                printed,
+                battlefield_only,
+                graveyard_only,
+                departed
+            ]
+        );
+        assert!(trigger_definition_functions_in_zone(
+            &battlefield_trigger,
+            Zone::Battlefield
+        ));
+        assert!(trigger_definition_functions_in_zone(
+            &graveyard_trigger,
+            Zone::Graveyard
+        ));
+        assert!(
+            trigger_definition_functions_in_zone(&exile_trigger(), Zone::Exile),
+            "the departed owner's card carries an exile trigger; CR 800.4a excludes it"
+        );
+        assert!(
+            source_has_trigger_in_zone(&state, granted, Zone::Exile),
+            "reach-guard: unreconciled granted Suspend is an exile trigger source"
+        );
+
+        reset_off_zone_keyword_scope_counts();
+        let scanned = trigger_source_ids_for_zone(&state, Zone::Exile);
+        let counts = off_zone_keyword_scope_counts();
+        assert!(counts.matched >= 2, "reach-guard: {counts:?}");
+        assert_eq!(counts.fills, 1, "{counts:?}");
+        assert_eq!(counts.hits, counts.matched - 1, "{counts:?}");
+        assert_eq!(off_zone_keyword_scope_depth(), 0);
+        assert_eq!(scanned, vec![granted, printed]);
+
+        // The collector's production shape: reconciliation installs Suspend's
+        // exile companions, and the granted card stays listed through them.
+        reconcile_off_zone_keyword_triggers(&mut state);
+        assert!(
+            crate::game::functioning_abilities::active_trigger_definitions(
+                &state,
+                &state.objects[&granted],
+            )
+            .any(|active| trigger_definition_functions_in_zone(active.definition, Zone::Exile)),
+            "reach-guard: reconciliation installed Suspend's exile companions"
+        );
+        assert_eq!(
+            trigger_source_ids_for_zone(&state, Zone::Exile),
+            vec![granted, printed]
+        );
+    }
+
+    /// CR 800.4a + CR 800.4d: when a player leaves the game, the cards that
+    /// player owns leave with them, and a triggered ability that player would
+    /// control isn't put on the stack. A card in the departing player's
+    /// graveyard with a printed "When this card is put into exile" trigger,
+    /// which functions from exile (CR 113.6b), therefore triggers nothing as
+    /// the player-leaves sweep moves it to exile. The paired control moves the
+    /// same card from graveyard to exile while its owner is still in the game,
+    /// and that trigger fires. A preservation row: the result is the same
+    /// without the exile trigger-source filter.
+    #[test]
+    fn departed_owners_exile_trigger_does_not_fire_as_it_leaves_the_game() {
+        use crate::game::scenario::{GameRunner, GameScenario};
+
+        const OWNER: PlayerId = PlayerId(2);
+
+        /// A three-player game at P0's precombat main phase. OWNER's graveyard
+        /// holds a card with the parser's self-referential "is put into exile"
+        /// shape: SelfRef, destination Exile, functioning on the battlefield,
+        /// in a graveyard and in exile.
+        fn build() -> (GameRunner, ObjectId) {
+            let mut scenario = GameScenario::new_n_player(3, 42);
+            scenario.at_phase(Phase::PreCombatMain);
+            let card = scenario
+                .add_creature_to_graveyard(OWNER, "Exile-Trigger Card", 2, 2)
+                .id();
+            let mut runner = scenario.build();
+            let trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+                .destination(Zone::Exile)
+                .valid_card(TargetFilter::SelfRef)
+                .trigger_zones(vec![Zone::Battlefield, Zone::Graveyard, Zone::Exile])
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                ));
+            let object = runner.state_mut().objects.get_mut(&card).unwrap();
+            std::sync::Arc::make_mut(&mut object.base_trigger_definitions).push(trigger);
+            object.materialize_base_trigger_definitions();
+            (runner, card)
+        }
+
+        /// Whether a trigger from `card` is on the stack or waiting to be put there.
+        fn has_trigger_from(state: &GameState, card: ObjectId) -> bool {
+            state.stack.iter().any(|entry| entry.source_id == card)
+                || state
+                    .pending_trigger
+                    .as_ref()
+                    .is_some_and(|pending| pending.source_id == card)
+                || state
+                    .deferred_triggers
+                    .iter()
+                    .any(|context| context.pending.source_id == card)
+                || state.pending_trigger_order.as_ref().is_some_and(|order| {
+                    order
+                        .groups
+                        .iter()
+                        .flat_map(|group| &group.triggers)
+                        .any(|context| context.pending.source_id == card)
+                })
+        }
+
+        // Paired positive: the owner is still in the game, and the same card
+        // moved from graveyard to exile fires its trigger.
+        let (mut runner, card) = build();
+        let state = runner.state_mut();
+        let mut events = Vec::new();
+        move_to_zone(state, card, Zone::Exile, &mut events);
+        process_triggers(state, &events);
+        assert!(
+            has_trigger_from(state, card),
+            "reach-guard: a graveyard-to-exile move fires the card's exile trigger"
+        );
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            runner.life(OWNER),
+            21,
+            "reach-guard: the trigger resolves for its living controller"
+        );
+
+        // The owner leaves the game; the sweep moves the same card to exile.
+        let (mut runner, card) = build();
+        let result = runner
+            .act(GameAction::Concede { player_id: OWNER })
+            .expect("the owner concedes");
+        assert!(
+            result.events.iter().any(|event| matches!(
+                event,
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from: Some(Zone::Graveyard),
+                    to: Zone::Exile,
+                    ..
+                } if *object_id == card
+            )),
+            "reach-guard: the player-leaves sweep moves the card from graveyard to exile"
+        );
+        assert!(
+            !has_trigger_from(runner.state(), card),
+            "CR 800.4d: no trigger from the departed owner's card"
+        );
+        runner.advance_until_stack_empty();
+        assert!(
+            !has_trigger_from(runner.state(), card),
+            "CR 800.4d: no trigger from the departed owner's card after the stack drains"
+        );
     }
 
     /// Off-zone trigger reconciliation fills the keyword scope once and matches unscoped results.
