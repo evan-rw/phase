@@ -45598,12 +45598,12 @@ pub mod tests {
 
     /// CR 113.6 + CR 113.6b + CR 702.62a: the production trigger collector
     /// projects a source context only for the exiled cards whose triggers
-    /// function in exile. `GameRunner` drives the mixed exile of
-    /// `exile_trigger_scan_keeps_only_exile_trigger_sources`, plus a printed
+    /// function in exile. `GameRunner` drives the `MixedExile` fixture shared
+    /// with `exile_trigger_scan_keeps_only_exile_trigger_sources`, plus a printed
     /// Suspend card, from player 0's untap step through upkeep to the precombat
     /// main phase. `trigger_source_context_for_latch`, where the collector
-    /// projects each listed source that has not itself just moved (no card
-    /// here moves), sees the printed exile trigger and both Suspend cards, and
+    /// projects each listed source that has not itself just moved (no exiled
+    /// card moves here), sees the printed exile trigger and both Suspend cards, and
     /// never the cards with no trigger, a battlefield-only trigger or a
     /// graveyard-only trigger; both Suspend cards still lose a time counter.
     /// Fails with the exile filter reverted, which lists every exiled card.
