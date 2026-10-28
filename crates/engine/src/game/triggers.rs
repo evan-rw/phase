@@ -46245,8 +46245,8 @@ pub mod tests {
                     .active_zones(vec![Zone::Exile]),
             );
         // CR 611.2a: the transient lasts until the end of the game
-        // (`Duration::Permanent`), so every keyword gather in the drive checks
-        // its liveness.
+        // (`Duration::Permanent`), so it stays stored for the whole drive;
+        // because it grants a keyword, every keyword gather checks its liveness.
         state.add_transient_continuous_effect(
             granter,
             PlayerId(0),
