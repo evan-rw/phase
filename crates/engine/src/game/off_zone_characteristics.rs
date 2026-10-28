@@ -102,9 +102,10 @@ struct OffZoneKeywordFrame {
     /// The scoped state's static-effect sources outside the battlefield and
     /// command zone, once a gather in this scope has scanned for them. Which
     /// objects those are depends on no filter or condition, so every gather
-    /// for this state shares them, `ContextDependent` ones included. CR 611.3a:
-    /// a static's effect is not locked in, so the list is valid only for this
-    /// frame's unchanged state and ends with the frame.
+    /// for this state shares them, `ContextDependent` ones included.
+    /// CR 611.3b + CR 113.6: an off-zone static's effect applies only while
+    /// its source is in a zone the ability functions from, so the list is
+    /// valid only for this frame's unchanged state and ends with the frame.
     off_zone_sources: Option<std::rc::Rc<OffZoneStaticSourceIds>>,
 }
 

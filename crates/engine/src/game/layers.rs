@@ -7792,7 +7792,13 @@ fn gather_ring_emblem_continuous_effects(
 /// effect sources (CR 113.6b opt-in zones, CR 604.3 CDAs), as one walk of one
 /// state's object map found them, in that walk's visit order. Built only by
 /// [`OffZoneStaticSourceIds::scan`]; valid only for the state it was scanned
-/// from, and only while that state is unchanged.
+/// from, and only while that state is unchanged. The list holds no borrow of
+/// that state, and its recorded address confirms only that a read is against
+/// a state at the same address: it cannot detect an in-place change. In
+/// production the off-zone keyword scope keeps the list fresh: `scan` is
+/// called only from `off_zone_characteristics::scoped_off_zone_static_sources`,
+/// which keeps the list in the open scope's frame, and the scope holds a
+/// shared borrow of the state for the frame's whole life.
 pub(crate) struct OffZoneStaticSourceIds {
     ids: Vec<ObjectId>,
     /// Address identity of the scanned state. Only ever compared with
@@ -7938,7 +7944,9 @@ fn for_each_static_effect_source_from(
         OffZoneStaticSources::Known(sources) => {
             debug_assert!(
                 std::ptr::eq(sources.scanned_from, state),
-                "an off-zone static source list is read only against the state it was scanned from"
+                "an off-zone static source list is read only against the state it was scanned \
+                 from; this check compares addresses only, so it cannot see an in-place change, \
+                 which in production the off-zone keyword scope's shared borrow prevents"
             );
             for id in &sources.ids {
                 let Some(obj) = state.objects.get(id) else {
@@ -7972,7 +7980,7 @@ fn is_off_zone_static_effect_source(obj: &crate::game::game_object::GameObject) 
     // included). Command-zone sources (emblems, face-up conspiracies, and
     // active planes/phenomena that opt in) were fully handled by the two
     // command loops above via `object_sources_static_from_command_zone`, so
-    // the `Command` arm is excluded here to avoid double-visiting (CR 114.4).
+    // the `Command` arm is excluded here to avoid double-visiting (CR 113.6p).
     if matches!(obj.zone, Zone::Battlefield | Zone::Command) || obj.is_phased_out() {
         return false;
     }
