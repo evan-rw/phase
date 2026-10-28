@@ -8,11 +8,13 @@
 //! argument parsing, per-game stdout framing, flush timing, process exit — not
 //! an internal function's.
 //!
-//! Every test here is `#[ignore]`d: it loads `client/public/card-data.json`
-//! (requires `cargo run --bin card-data-export` or the setup.sh script), which
-//! is not available in unit-test CI — the same convention as
-//! `greasefang_bounded.rs`/`whitemane_lion_bounded.rs`. Opt in via
+//! Every test that spawns the binary is `#[ignore]`d: the binary loads
+//! `client/public/card-data.json` (requires `cargo run --bin card-data-export`
+//! or the setup.sh script), which is not available in unit-test CI — the same
+//! convention as `greasefang_bounded.rs`/`whitemane_lion_bounded.rs`. Opt in via
 //! `cargo test -p phase-ai --test ai_commander_batch_equivalence -- --ignored`.
+//! The one exception, `wall_clock_masking_hides_only_timing_values`, tests the
+//! output-masking helper on sample rows: it spawns nothing and runs in CI.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -110,14 +112,43 @@ fn seat_row_labels<'a>(stdout: &'a str, field: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// `stdout` without its wall-clock lines (`elapsed=` on turn lines, the
-/// `Elapsed:` RESULT row), so two separately-timed runs compare equal.
-fn without_wall_clock_lines(stdout: &str) -> String {
+/// `stdout` with every line kept and only its wall-clock values masked (see
+/// [`mask_wall_clock_value`]): the turn number, active seat, action counts and
+/// life snapshot on turn rows and the seat, turn and action count on
+/// ELIMINATED rows stay in the comparison, so two separately-timed runs compare
+/// equal only when everything they printed apart from timing is the same.
+fn with_wall_clock_masked(stdout: &str) -> String {
     stdout
         .lines()
-        .filter(|line| !line.contains("elapsed=") && !line.starts_with("Elapsed:"))
+        .map(mask_wall_clock_value)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `line` with the seconds value after its wall-clock label replaced by a
+/// fixed placeholder. The label is a leading `Elapsed: ` (the RESULT row) or
+/// the first `elapsed=` (turn and ELIMINATED rows). The value is the run of
+/// spaces after the label, which is the turn row's `{:>6.1}` padding and is
+/// empty on the ELIMINATED row's `{:.1}`, followed by the number's digits and
+/// `.`. The padding is masked along with the digits because its width depends
+/// on the value. The `s` unit and the rest of the line are kept, so the mask
+/// ends before a turn row's life snapshot. A line with neither label is
+/// returned unchanged.
+fn mask_wall_clock_value(line: &str) -> String {
+    const ROW_LABEL: &str = "Elapsed: ";
+    const FIELD_LABEL: &str = "elapsed=";
+    const MASK: &str = "<wall-clock>";
+    let (through_label, value_onward) = if let Some(value_onward) = line.strip_prefix(ROW_LABEL) {
+        (ROW_LABEL, value_onward)
+    } else if let Some(at) = line.find(FIELD_LABEL) {
+        line.split_at(at + FIELD_LABEL.len())
+    } else {
+        return line.to_owned();
+    };
+    let unit_onward = value_onward
+        .trim_start_matches(' ')
+        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+    format!("{through_label}{MASK}{unit_onward}")
 }
 
 /// Higher action cap for the cross-game-leakage regression below: the
@@ -439,8 +470,8 @@ fn explicit_default_players_matches_the_unflagged_invocation() {
         "--players 4 preamble differs from the default:\n{flagged}"
     );
     assert_eq!(
-        without_wall_clock_lines(&unflagged),
-        without_wall_clock_lines(&flagged)
+        with_wall_clock_masked(&unflagged),
+        with_wall_clock_masked(&flagged)
     );
 }
 
@@ -478,4 +509,129 @@ fn players_flag_applies_to_every_game_in_a_batch() {
         assert_eq!(seat_row_labels(block, "  life="), ["P0", "P1"]);
     }
     assert_eq!(seat_row_labels(&batch, "  main="), ["P0", "P1"]);
+}
+
+/// The values one `wall_clock_masking_hides_only_timing_values` sample run
+/// varies.
+#[derive(Clone, Copy)]
+struct SampleRun {
+    /// Wall-clock seconds on the turn row, the ELIMINATED row and the RESULT
+    /// `Elapsed:` row, in that order.
+    secs: [f64; 3],
+    /// The turn row's `actions=` value.
+    turn_actions: u32,
+    /// P3's life in the turn row's snapshot.
+    p3_life: i32,
+    /// The seat the ELIMINATED row names.
+    eliminated: u8,
+    /// The RESULT block's `Total actions:` value, on a line with no timing.
+    total_actions: u32,
+}
+
+impl SampleRun {
+    /// A short stdout in `ai-commander`'s own row formats: each row uses the
+    /// literal text and format specs of the matching `println!` in
+    /// `play_one_game` (arguments inlined), so the turn row's `{:>6.1}`
+    /// padding comes from the formatter rather than from hand-counted spaces.
+    fn stdout(self) -> String {
+        let Self {
+            secs: [turn_secs, eliminated_secs, total_secs],
+            turn_actions,
+            p3_life,
+            eliminated,
+            total_actions,
+        } = self;
+        let (turn, active) = (7, 2);
+        let (eliminated_turn, eliminated_actions) = (9, 212);
+        let snapshot = [40, 40, 40, p3_life]
+            .iter()
+            .enumerate()
+            .map(|(i, life)| format!("P{i}:{life}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        [
+            "Game started. 4 players.".to_owned(),
+            format!(
+                "Turn {turn:>2} (active P{active})  actions={turn_actions:>6}  elapsed={turn_secs:>6.1}s  {snapshot}"
+            ),
+            format!(
+                "ELIMINATED: P{eliminated}  turn={eliminated_turn}  actions={eliminated_actions:>6}  elapsed={eliminated_secs:.1}s"
+            ),
+            String::new(),
+            "=== RESULT ===".to_owned(),
+            format!("Elapsed: {total_secs:.1}s"),
+            format!("Total actions: {total_actions}"),
+        ]
+        .join("\n")
+    }
+}
+
+/// `with_wall_clock_masked` on rows rendered in `ai-commander`'s own formats.
+/// Two runs that differ only in their three wall-clock readings compare equal
+/// once masked; a run that also differs in one deterministic value does not.
+/// A helper that drops the timing rows instead of masking them passes the
+/// equality and fails at the turn-row life total; one that masks nothing, or
+/// keeps the padding's width, fails the equality. This test spawns nothing and
+/// loads no card data, so it is not ignored and runs in CI.
+#[test]
+fn wall_clock_masking_hides_only_timing_values() {
+    let fast = SampleRun {
+        secs: [0.3, 0.4, 0.6],
+        turn_actions: 143,
+        p3_life: 36,
+        eliminated: 1,
+        total_actions: 300,
+    };
+    // `   0.3` against `  12.3` on the turn row: the padding narrows as the
+    // value widens. The ELIMINATED and `Elapsed:` values are unpadded.
+    let slow = SampleRun {
+        secs: [12.3, 15.8, 21.0],
+        ..fast
+    };
+    assert_ne!(
+        fast.stdout(),
+        slow.stdout(),
+        "the sample runs must differ before masking"
+    );
+    assert_eq!(
+        with_wall_clock_masked(&fast.stdout()),
+        with_wall_clock_masked(&slow.stdout()),
+        "runs that differ only in wall-clock values must compare equal once masked"
+    );
+    for (value, other) in [
+        (
+            "turn-row life total",
+            SampleRun {
+                p3_life: 35,
+                ..slow
+            },
+        ),
+        (
+            "turn-row action count",
+            SampleRun {
+                turn_actions: 144,
+                ..slow
+            },
+        ),
+        (
+            "ELIMINATED seat",
+            SampleRun {
+                eliminated: 2,
+                ..slow
+            },
+        ),
+        (
+            "RESULT total actions",
+            SampleRun {
+                total_actions: 299,
+                ..slow
+            },
+        ),
+    ] {
+        assert_ne!(
+            with_wall_clock_masked(&fast.stdout()),
+            with_wall_clock_masked(&other.stdout()),
+            "runs that differ in the {value} must not compare equal once masked"
+        );
+    }
 }
