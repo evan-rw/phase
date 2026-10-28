@@ -215,6 +215,10 @@ fn scoped_off_zone_static_sources(state: &GameState) -> std::rc::Rc<OffZoneStati
 /// normal return, early return, or unwind.
 struct OffZoneKeywordScopeGuard {
     pushed: Option<*const GameState>,
+    /// Test-only: the readings as this guard pushed its frame, taken only while
+    /// [`off_zone_keyword_scopes_during`] records.
+    #[cfg(test)]
+    recorded_from: Option<OffZoneKeywordScopeRecord>,
 }
 
 impl OffZoneKeywordScopeGuard {
@@ -236,7 +240,12 @@ impl OffZoneKeywordScopeGuard {
                 Some(address)
             }
         });
-        Self { pushed }
+        Self {
+            pushed,
+            #[cfg(test)]
+            recorded_from: pushed
+                .and_then(|_| OffZoneKeywordScopeRecord::reading_while_recording()),
+        }
     }
 }
 
@@ -253,6 +262,8 @@ impl Drop for OffZoneKeywordScopeGuard {
                 }
             });
         }
+        #[cfg(test)]
+        record_off_zone_keyword_scope_frame(self.recorded_from);
     }
 }
 
@@ -287,6 +298,22 @@ pub(crate) struct OffZoneKeywordScopeCounts {
     pub(crate) unmatched: usize,
     /// Effects cloned out of a shared slice.
     pub(crate) shared_clones: usize,
+}
+
+#[cfg(test)]
+impl OffZoneKeywordScopeCounts {
+    /// The tallies accumulated since `start`, an earlier reading on this
+    /// thread with no reset in between.
+    fn since(self, start: Self) -> Self {
+        Self {
+            matched: self.matched - start.matched,
+            fills: self.fills - start.fills,
+            hits: self.hits - start.hits,
+            context_fall_opens: self.context_fall_opens - start.context_fall_opens,
+            unmatched: self.unmatched - start.unmatched,
+            shared_clones: self.shared_clones - start.shared_clones,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +357,71 @@ pub(crate) fn off_zone_keyword_scope_counts() -> OffZoneKeywordScopeCounts {
 #[cfg(test)]
 pub(crate) fn off_zone_keyword_scope_depth() -> usize {
     with_off_zone_keyword_frames(|frames| frames.len())
+}
+
+/// Test-only: walks of the object map for off-zone static-effect sources
+/// (`layers::off_zone_static_source_scan_count`) and the scope tallies. A
+/// recorded frame's value is what accumulated on this thread, by any code,
+/// between the frame's push and its pop.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OffZoneKeywordScopeRecord {
+    /// Walks of the object map for off-zone static-effect sources.
+    pub(crate) source_scans: usize,
+    /// The scope tallies.
+    pub(crate) counts: OffZoneKeywordScopeCounts,
+}
+
+#[cfg(test)]
+impl OffZoneKeywordScopeRecord {
+    /// This thread's running readings, if a recording is open.
+    fn reading_while_recording() -> Option<Self> {
+        OFF_ZONE_KEYWORD_SCOPE_RECORDS
+            .with_borrow(Option::is_some)
+            .then(|| Self {
+                source_scans: crate::game::layers::off_zone_static_source_scan_count(),
+                counts: off_zone_keyword_scope_counts(),
+            })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only record of the scope frames pushed and popped on this thread, in
+    /// pop order. It holds a list only while `off_zone_keyword_scopes_during`
+    /// runs, so the hook keeps nothing for any other test.
+    static OFF_ZONE_KEYWORD_SCOPE_RECORDS: std::cell::RefCell<Option<Vec<OffZoneKeywordScopeRecord>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Appends, to this thread's open recording, what accumulated since `opened`:
+/// the readings taken when the frame now being popped was pushed.
+#[cfg(test)]
+fn record_off_zone_keyword_scope_frame(opened: Option<OffZoneKeywordScopeRecord>) {
+    let (Some(opened), Some(now)) = (opened, OffZoneKeywordScopeRecord::reading_while_recording())
+    else {
+        return;
+    };
+    let record = OffZoneKeywordScopeRecord {
+        source_scans: now.source_scans - opened.source_scans,
+        counts: now.counts.since(opened.counts),
+    };
+    OFF_ZONE_KEYWORD_SCOPE_RECORDS.with_borrow_mut(|records| {
+        if let Some(records) = records {
+            records.push(record);
+        }
+    });
+}
+
+/// Runs `f` with a scope recording open on this thread and returns, in pop
+/// order, a record of every scope frame pushed and popped while `f` ran.
+#[cfg(test)]
+pub(crate) fn off_zone_keyword_scopes_during(f: impl FnOnce()) -> Vec<OffZoneKeywordScopeRecord> {
+    let outer = OFF_ZONE_KEYWORD_SCOPE_RECORDS.replace(Some(Vec::new()));
+    f();
+    OFF_ZONE_KEYWORD_SCOPE_RECORDS
+        .replace(outer)
+        .unwrap_or_default()
 }
 
 pub fn effective_off_zone_keywords(state: &GameState, object_id: ObjectId) -> Vec<Keyword> {
