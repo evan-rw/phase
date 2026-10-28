@@ -7980,7 +7980,8 @@ fn is_off_zone_static_effect_source(obj: &crate::game::game_object::GameObject) 
     // included). Command-zone sources (emblems, face-up conspiracies, and
     // active planes/phenomena that opt in) were fully handled by the two
     // command loops above via `object_sources_static_from_command_zone`, so
-    // the `Command` arm is excluded here to avoid double-visiting (CR 113.6p).
+    // the `Command` arm is excluded here to avoid double-visiting
+    // (CR 113.6p + CR 901.7).
     if matches!(obj.zone, Zone::Battlefield | Zone::Command) || obj.is_phased_out() {
         return false;
     }
