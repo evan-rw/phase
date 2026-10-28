@@ -2332,6 +2332,8 @@ pub fn trigger_source_context_for_latch(
     state: &GameState,
     source: &GameObject,
 ) -> TriggerSourceContext {
+    #[cfg(test)]
+    note_trigger_source_latch_visit(source);
     let mut record = source.snapshot_for_zone_change(source.id, Some(source.zone), source.zone);
     record.attachments = super::zones::capture_attachment_snapshot(state, source);
     record.linked_exile_snapshot =
@@ -2348,6 +2350,38 @@ pub fn trigger_source_context_for_latch(
         .cloned()
         .unwrap_or_default();
     source_context
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only record of the sources `trigger_source_context_for_latch`
+    /// projects on this thread, as (source id, source zone) in call order. It
+    /// holds a list only while `trigger_source_latch_visits_during` runs, so the
+    /// seam keeps nothing for any other test.
+    static TRIGGER_SOURCE_LATCH_VISITS: std::cell::RefCell<Option<Vec<(ObjectId, Zone)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Appends `source` to this thread's open latch-visit record, if one is open.
+#[cfg(test)]
+fn note_trigger_source_latch_visit(source: &GameObject) {
+    TRIGGER_SOURCE_LATCH_VISITS.with_borrow_mut(|visits| {
+        if let Some(visits) = visits {
+            visits.push((source.id, source.zone));
+        }
+    });
+}
+
+/// Runs `f` with a latch-visit record open on this thread, and returns every
+/// (source id, source zone) that `trigger_source_context_for_latch` projected
+/// while `f` ran.
+#[cfg(test)]
+fn trigger_source_latch_visits_during(f: impl FnOnce()) -> Vec<(ObjectId, Zone)> {
+    let outer = TRIGGER_SOURCE_LATCH_VISITS.replace(Some(Vec::new()));
+    f();
+    TRIGGER_SOURCE_LATCH_VISITS
+        .replace(outer)
+        .unwrap_or_default()
 }
 
 /// Selects a trigger source's event-time authority for one matching pass.
@@ -45403,6 +45437,63 @@ pub mod tests {
         assert_eq!(scanned, expected);
     }
 
+    /// Player 0's mixed exile, shared by the exile trigger-source tests: a card
+    /// with no trigger (`inert`), a card granted Suspend by a battlefield
+    /// permanent's static (`granted`, CR 702.62a), a card with a printed trigger
+    /// that states it functions in exile (`printed`, CR 113.6b), and cards whose
+    /// trigger functions only on the battlefield (`battlefield_only`, CR 113.6)
+    /// or only in a graveyard (`graveyard_only`, CR 113.6b).
+    struct MixedExile {
+        inert: ObjectId,
+        granted: ObjectId,
+        printed: ObjectId,
+        battlefield_only: ObjectId,
+        graveyard_only: ObjectId,
+    }
+
+    impl MixedExile {
+        /// `printed`'s trigger, which states that it functions in exile.
+        fn exile_trigger() -> TriggerDefinition {
+            TriggerDefinition::new(TriggerMode::BecomesPlotted).trigger_zones(vec![Zone::Exile])
+        }
+
+        /// `battlefield_only`'s trigger, which states no zone.
+        fn battlefield_trigger() -> TriggerDefinition {
+            TriggerDefinition::new(TriggerMode::ChangesZone)
+        }
+
+        /// `graveyard_only`'s trigger, which states that it functions in a graveyard.
+        fn graveyard_trigger() -> TriggerDefinition {
+            TriggerDefinition::new(TriggerMode::ChangesZone).trigger_zones(vec![Zone::Graveyard])
+        }
+
+        /// Exiles the five cards (card ids 8300 to 8304) and creates the
+        /// permanent that grants `granted` Suspend.
+        fn build(state: &mut GameState) -> Self {
+            let mixed = Self {
+                inert: off_zone_test_card(state, 0, Zone::Exile),
+                granted: off_zone_test_card(state, 1, Zone::Exile),
+                printed: off_zone_test_card(state, 2, Zone::Exile),
+                battlefield_only: off_zone_test_card(state, 3, Zone::Exile),
+                graveyard_only: off_zone_test_card(state, 4, Zone::Exile),
+            };
+            for (id, definition) in [
+                (mixed.printed, Self::exile_trigger()),
+                (mixed.battlefield_only, Self::battlefield_trigger()),
+                (mixed.graveyard_only, Self::graveyard_trigger()),
+            ] {
+                state
+                    .objects
+                    .get_mut(&id)
+                    .unwrap()
+                    .trigger_definitions
+                    .push(definition);
+            }
+            grant_off_zone_trigger_keywords(state, None, Some(mixed.granted));
+            mixed
+        }
+    }
+
     /// CR 113.6 + CR 113.6b: the exile trigger-source scan lists only exiled
     /// cards with a functioning trigger that functions from exile — printed, or
     /// a keyword companion granted off-zone (CR 702.62a) — and shares one
@@ -45417,18 +45508,18 @@ pub mod tests {
             reset_off_zone_keyword_scope_counts,
         };
 
-        let exile_trigger =
-            || TriggerDefinition::new(TriggerMode::BecomesPlotted).trigger_zones(vec![Zone::Exile]);
-        let battlefield_trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
-        let graveyard_trigger =
-            TriggerDefinition::new(TriggerMode::ChangesZone).trigger_zones(vec![Zone::Graveyard]);
+        let exile_trigger = MixedExile::exile_trigger;
+        let battlefield_trigger = MixedExile::battlefield_trigger();
+        let graveyard_trigger = MixedExile::graveyard_trigger();
 
         let mut state = setup();
-        let inert = off_zone_test_card(&mut state, 0, Zone::Exile);
-        let granted = off_zone_test_card(&mut state, 1, Zone::Exile);
-        let printed = off_zone_test_card(&mut state, 2, Zone::Exile);
-        let battlefield_only = off_zone_test_card(&mut state, 3, Zone::Exile);
-        let graveyard_only = off_zone_test_card(&mut state, 4, Zone::Exile);
+        let MixedExile {
+            inert,
+            granted,
+            printed,
+            battlefield_only,
+            graveyard_only,
+        } = MixedExile::build(&mut state);
         let departed = create_object(
             &mut state,
             CardId(8310),
@@ -45436,20 +45527,12 @@ pub mod tests {
             "Departed Owner's Card".to_string(),
             Zone::Exile,
         );
-        for (id, definition) in [
-            (printed, exile_trigger()),
-            (battlefield_only, battlefield_trigger.clone()),
-            (graveyard_only, graveyard_trigger.clone()),
-            (departed, exile_trigger()),
-        ] {
-            state
-                .objects
-                .get_mut(&id)
-                .unwrap()
-                .trigger_definitions
-                .push(definition);
-        }
-        grant_off_zone_trigger_keywords(&mut state, None, Some(granted));
+        state
+            .objects
+            .get_mut(&departed)
+            .unwrap()
+            .trigger_definitions
+            .push(exile_trigger());
         state
             .players
             .iter_mut()
@@ -45511,6 +45594,146 @@ pub mod tests {
             trigger_source_ids_for_zone(&state, Zone::Exile),
             vec![granted, printed]
         );
+    }
+
+    /// CR 113.6 + CR 113.6b + CR 702.62a: the production trigger collector
+    /// projects a source context only for the exiled cards whose triggers
+    /// function in exile. `GameRunner` drives the mixed exile of
+    /// `exile_trigger_scan_keeps_only_exile_trigger_sources`, plus a printed
+    /// Suspend card, from player 0's untap step through upkeep to the precombat
+    /// main phase. `trigger_source_context_for_latch`, where the collector
+    /// projects each listed source that has not itself just moved (no card
+    /// here moves), sees the printed exile trigger and both Suspend cards, and
+    /// never the cards with no trigger, a battlefield-only trigger or a
+    /// graveyard-only trigger; both Suspend cards still lose a time counter.
+    /// Fails with the exile filter reverted, which lists every exiled card.
+    #[test]
+    fn upkeep_collection_projects_only_exile_trigger_sources() {
+        use crate::game::scenario::GameRunner;
+
+        let time_counters = |state: &GameState, id: ObjectId| {
+            state.objects[&id].counters.get(&CounterType::Time).copied()
+        };
+
+        let mut state = setup();
+        let MixedExile {
+            inert,
+            granted,
+            printed,
+            battlefield_only,
+            graveyard_only,
+        } = MixedExile::build(&mut state);
+        // A printed Suspend card carries the keyword and the two triggers that
+        // `synthesize_suspend` gives every printed Suspend card (CR 702.62a).
+        let suspend = Keyword::Suspend {
+            count: 4,
+            cost: ManaCost::generic(1),
+        };
+        let mut face = crate::types::card::CardFace {
+            keywords: vec![suspend.clone()],
+            ..Default::default()
+        };
+        crate::database::synthesis::synthesize_suspend(&mut face);
+        let printed_suspend = off_zone_test_card(&mut state, 5, Zone::Exile);
+        {
+            let card = state.objects.get_mut(&printed_suspend).unwrap();
+            card.keywords.push(suspend.clone());
+            card.base_keywords.push(suspend);
+            for definition in face.triggers {
+                card.push_printed_trigger(definition);
+            }
+        }
+        // CR 702.62b: an exiled card with suspend and a time counter is suspended.
+        for id in [granted, printed_suspend] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .counters
+                .insert(CounterType::Time, 4);
+        }
+        // CR 504.1 + CR 704.5b: player 0 draws in the draw step; an empty
+        // library would lose the game.
+        for index in 0..3 {
+            create_object(
+                &mut state,
+                CardId(8320 + index),
+                PlayerId(0),
+                format!("Library Card {index}"),
+                Zone::Library,
+            );
+        }
+        state.turn_number = 2;
+        state.phase = Phase::Untap;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        assert_eq!(
+            crate::game::targeting::zone_object_ids(&state, Zone::Exile),
+            vec![
+                inert,
+                granted,
+                printed,
+                battlefield_only,
+                graveyard_only,
+                printed_suspend
+            ],
+            "reach-guard: all six cards are exiled"
+        );
+
+        let mut runner = GameRunner::from_state(state);
+        let visits = trigger_source_latch_visits_during(|| {
+            runner.auto_advance_to_main_phase();
+            runner.advance_until_stack_empty();
+        });
+        let projected_from_exile: HashSet<ObjectId> = visits
+            .iter()
+            .filter(|(_, zone)| *zone == Zone::Exile)
+            .map(|(id, _)| *id)
+            .collect();
+        for (source, label) in [
+            (printed, "printed exile trigger"),
+            (granted, "granted Suspend"),
+            (printed_suspend, "printed Suspend"),
+        ] {
+            assert!(
+                projected_from_exile.contains(&source),
+                "reach-guard: the collector projects the {label} card from exile"
+            );
+        }
+        let projected_without_exile_trigger: Vec<ObjectId> =
+            [inert, battlefield_only, graveyard_only]
+                .into_iter()
+                .filter(|id| projected_from_exile.contains(id))
+                .collect();
+        assert_eq!(
+            projected_without_exile_trigger,
+            Vec::<ObjectId>::new(),
+            "CR 113.6 + CR 113.6b: an exiled card with no trigger that functions in exile \
+             is not projected as a trigger source"
+        );
+
+        // CR 702.62a: each suspended card's upkeep trigger removed one time counter.
+        assert_eq!(
+            time_counters(runner.state(), granted),
+            Some(3),
+            "the card granted Suspend loses one time counter (4 to 3)"
+        );
+        assert_eq!(
+            time_counters(runner.state(), printed_suspend),
+            Some(3),
+            "the printed Suspend card loses one time counter (4 to 3)"
+        );
+        assert_eq!(runner.state().phase, Phase::PreCombatMain);
+        assert!(runner.state().stack.is_empty());
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority {
+                player: PlayerId(0)
+            }
+        ));
     }
 
     /// CR 800.4a + CR 800.4d: when a player leaves the game, the cards that
