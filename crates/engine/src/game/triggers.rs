@@ -45742,11 +45742,12 @@ pub mod tests {
     /// state-based action (CR 704.5a), and the player-leaves sweep moves a card
     /// from OWNER's graveyard to exile, recording the move as a
     /// `ZoneDeparture::LeftGame` departure. The card's "When this card is put
-    /// into exile from anywhere" trigger has a graveyard-origin trigger
-    /// condition, which can't trigger from the battlefield and so functions
-    /// where it can trigger (CR 113.6k), looking back to the graveyard
-    /// (CR 603.10a); the engine matches it in the exile scan through the card's
-    /// zone-change record (its `trigger_zones` include Exile). Here it triggers
+    /// into exile from anywhere" trigger names no origin zone, so it is never a
+    /// leaves-the-battlefield ability (CR 603.6c). Its `trigger_zones` state
+    /// the zones it functions in: the battlefield, a graveyard and exile
+    /// (CR 113.6b, read through `trigger_definition_functions_in_zone`). The
+    /// engine matches it in the exile scan through the card's zone-change
+    /// record. Here it triggers
     /// nothing, for three independent reasons, each sufficient on its own:
     /// `zone_change_clause_matches` (via `match_changes_zone`) lets a left-game
     /// departure match only a battlefield-origin clause that names no
