@@ -7977,11 +7977,13 @@ fn off_zone_static_effect_source_candidates(
 /// answer is a pure function of the object.
 fn is_off_zone_static_effect_source(obj: &crate::game::game_object::GameObject) -> bool {
     // Battlefield objects were already processed above (phased-out gate
-    // included). Command-zone sources (emblems, face-up conspiracies, and
-    // active planes/phenomena that opt in) were fully handled by the two
-    // command loops above via `object_sources_static_from_command_zone`, so
-    // the `Command` arm is excluded here to avoid double-visiting
-    // (CR 113.6p + CR 901.7).
+    // included). Command-zone sources (emblems, face-up conspiracies, active
+    // planes/phenomena, and any other object with a CDA or a static that
+    // states the command zone, such as an Eminence commander) were fully
+    // handled by the two command loops above via
+    // `object_sources_static_from_command_zone`, so the `Command` arm is
+    // excluded here to avoid double-visiting
+    // (CR 113.6p + CR 901.7 + CR 113.6b + CR 604.3).
     if matches!(obj.zone, Zone::Battlefield | Zone::Command) || obj.is_phased_out() {
         return false;
     }
