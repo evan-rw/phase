@@ -4025,7 +4025,7 @@ pub(crate) mod tests {
             Simulated,
             false,
         ));
-        // CR 202.3 + CR 608.2c: a mana value counts the mana in a cost, so no selection's total is below zero; the printed restriction is enforced at submission.
+        // CR 202.3 + CR 701.23a: a mana value counts the mana in a cost, so no selection's total is below zero; a found card must match the search's description, which the guard enforces at submission.
         let mut constrained = tutor.clone();
         let WaitingFor::SearchChoice { constraint, .. } = &mut constrained.waiting_for else {
             unreachable!("the fixture asserts the search prompt");
@@ -4796,7 +4796,12 @@ pub(crate) mod tests {
     /// is scored again with every type simulated before anything is selected. The AI
     /// submits the type, and leaves its RNG where, the simulate-every-answer
     /// gate does, and the driver simulates that type once more before
-    /// submitting it.
+    /// submitting it. Its assertions do not tell that re-score apart from the
+    /// chooser's retake of a selected type that fails; rung 0's detection is
+    /// pinned by
+    /// `rung_zero_stops_at_the_first_admitted_answer_that_fails` (`search.rs`),
+    /// `ai_driver_scores_again_when_its_root_search_rejects_an_admitted_type`
+    /// and `ai_driver_scores_again_when_a_policy_rejected_beam_type_fails`.
     ///
     /// Fails if nothing simulates an admitted answer before it is submitted:
     /// the AI then submits a rejected type and `run_ai_action` stops with
@@ -4858,7 +4863,7 @@ pub(crate) mod tests {
         assert_eq!(
             decision.clones,
             offered + 1,
-            "the root search rejects the beam's types, every offered type is then \
+            "the root search rejects the first type in its beam, every offered type is then \
              simulated, and the submitted one once more"
         );
         assert_eq!(
@@ -4987,7 +4992,7 @@ pub(crate) mod tests {
         assert_eq!(
             decision.clones,
             offered + 1,
-            "the root search rejects the beam's admitted types, every offered type is then \
+            "the root search rejects the first admitted type in its beam, every offered type is then \
              simulated, and the submitted one once more"
         );
 
@@ -5342,6 +5347,16 @@ pub(crate) mod tests {
     /// `EachCandidate`, a second scoring pass. That second pass must run under
     /// the root-search deadline the first pass started.
     ///
+    /// The assertions do not tell that re-score apart from the chooser's retake
+    /// of a selected answer that fails: the chooser simulates a rejected type
+    /// it selects and takes the decision again under `EachCandidate`, a second
+    /// scoring pass that also runs under the deadline the first pass started,
+    /// with as many state copies. Rung 0's detection of a rejected admitted
+    /// answer is pinned by
+    /// `rung_zero_stops_at_the_first_admitted_answer_that_fails` (`search.rs`),
+    /// `ai_driver_scores_again_when_its_root_search_rejects_an_admitted_type`
+    /// and `ai_driver_scores_again_when_a_policy_rejected_beam_type_fails`.
+    ///
     /// Fails if the scorer hands its second pass a fresh `RootSearchDeadline`:
     /// that pass then starts a deadline of its own, at a later instant.
     #[test]
@@ -5376,7 +5391,7 @@ pub(crate) mod tests {
         );
         assert!(
             !deadlines[0].expired(),
-            "reach guard: the deadline is still live, so the first pass's root search ran its first rung and caught a rejected type; the second pass is the scorer's"
+            "reach guard: the first pass's deadline has not expired when the decision ends, so it did not stop that pass's root search before its first rung"
         );
         assert_eq!(
             deadlines[1], deadlines[0],
