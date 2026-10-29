@@ -468,10 +468,11 @@ fn choose_action_with_session_inner(
 
     // CR 608.2c + CR 701.23: SearchChoice picks have their own dedicated
     // beam-bounded scorer in `deterministic_choice`. Routing them through
-    // `score_candidates` first would run the planner's full tactical scoring
-    // over every legal SelectCards combination (and simulate each selection
-    // `structurally_valid_prompt_answer` defers, such as a scoped search's) —
-    // wasteful relative to the dedicated scorer. The deterministic path
+    // the scored path first would reach the same `deterministic_choice` (in
+    // `score_candidates_core_for_root`) only after its legality gate, which
+    // simulates each selection `structurally_valid_prompt_answer` defers (such
+    // as a scoped search's), and every selection in each determinized sample —
+    // wasteful relative to calling the dedicated scorer directly. The deterministic path
     // returns the chosen
     // SelectCards directly; only fall through if it produces nothing.
     if matches!(state.waiting_for, WaitingFor::SearchChoice { .. }) {

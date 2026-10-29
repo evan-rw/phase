@@ -1923,8 +1923,10 @@ impl PromptAnswerValidation {
     /// The validation the canonical chooser decides under first:
     /// `AtSubmission`, unless `config` scores the decision in determinized
     /// samples (`determinization_samples > 0`). Each sample simulates every
-    /// answer itself (`search::score_candidates_core`), so a simulation of the
-    /// submitted answer could not change the decision.
+    /// answer itself (`search::score_candidates_core`) on a world that differs
+    /// from the decision state only in opponents' hidden information, and the
+    /// chooser keeps deciding from those simulations, as it did before
+    /// `AtSubmission` existed.
     pub(crate) fn for_chooser(config: &AiConfig) -> Self {
         if config.search.determinization_samples > 0 || chooser_simulates_each_prompt_answer() {
             Self::EachCandidate
@@ -3103,8 +3105,8 @@ mod tests {
     // answer or a library search selection through
     // `engine::ai_support::structurally_valid_prompt_answer` instead of a state
     // copy + simulation, and only at the `NamedChoice` / `SearchChoice`
-    // windows. Every board is reached through the real cast/play pipeline from
-    // the card's verbatim Oracle text.
+    // windows. Every base board is reached through the real cast/play pipeline
+    // from the card's verbatim Oracle text.
     // ------------------------------------------------------------------
 
     const DISTANT_MELODY_ORACLE: &str =
@@ -3781,7 +3783,8 @@ mod tests {
     /// controlled-player and latched-search-controller boards, where someone
     /// other than the prompted player submits) and hostile shapes it must
     /// decline. Each row's simulation verdict also equals the reading derived
-    /// from the card text and the rules.
+    /// from the card text and the rules, or, on a board a row mutates after the
+    /// pipeline, from that mutated prompt.
     ///
     /// The two scope rows answer `ChooseOption` at Celestial Reunion's
     /// `CostTypeChoice` and `SelectCards` at Cultivate's
@@ -3845,7 +3848,9 @@ mod tests {
             ));
         }
 
-        // CR 701.23b/d: an "up to" search may find none.
+        // Synthetic board (not card-derived): Demonic Tutor's quantity search
+        // must find one card (CR 701.23d); with the prompt's up_to set, as an
+        // "up to N" search's is, the guard accepts finding none.
         let mut up_to_board = tutor.clone();
         let WaitingFor::SearchChoice { up_to, .. } = &mut up_to_board.waiting_for else {
             unreachable!("the fixture asserts the search prompt");

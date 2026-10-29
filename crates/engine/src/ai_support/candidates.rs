@@ -1480,13 +1480,12 @@ pub fn candidate_actions_broad_with_probe(
                     vec![*count]
                 };
             // Engine-side beam cap for *combinatorial* enumerations only. The AI
-            // scores every candidate returned here one selection at a time (and
-            // phase-ai's planner legality gate simulates each one on its
-            // score-only and sampled-world routes, and on the chooser's route
-            // each one `structurally_valid_prompt_answer` defers plus the one it
-            // submits, or every one when an admitted answer fails), so a count=4
-            // search against an 80-card library would
-            // produce ~C(80,4) ≈ 1.6M combinations and stall the AI for hours.
+            // scores every candidate returned here one selection at a time, and
+            // `SimulationFilter` and phase-ai's planner legality gate simulate
+            // each one `structurally_valid_prompt_answer` defers (the gate's
+            // score-only route simulates every one), so a count=4 search against
+            // an 80-card library would produce ~C(80,4) ≈ 1.6M combinations and
+            // stall the AI for hours.
             // The cap is constraint-aware so
             // distinct-name searches collapse duplicate-named entries before
             // combinatorial explosion (Gifts Ungiven against an 80-card pool with
@@ -6190,9 +6189,8 @@ fn station_target_candidates(
 /// alongside their twin), so the cap collapses sized libraries with many
 /// repeated names down to the unique-name set first. The cap exists strictly
 /// to bound the AI's per-selection work (scoring every issued selection, and
-/// simulating each one on the planner's score-only and sampled-world routes, or
-/// each one `structurally_valid_prompt_answer` defers on the chooser's, and every
-/// one there when an admitted answer fails); without it,
+/// simulating each one `structurally_valid_prompt_answer` defers, or every one
+/// on phase-ai's score-only route); without it,
 /// multi-card searches against large libraries stall the AI for hours. Player
 /// submissions are validated by the engine
 /// submission guard, not by this enumeration, so capping here cannot make a
