@@ -266,14 +266,19 @@ pub(crate) fn structurally_valid_tap_for_convoke_payment(
 
 /// CR 608.2d + CR 614.12a: A named choice made while an effect applies, or as a
 /// permanent enters, is announced from the prompt's enumerated domain, and the
-/// reducer accepts any member of it (`engine_resolution_choices.rs`, the
-/// `NamedChoice` arm) — so `SimulationFilter` can skip its clone-and-apply
-/// probe. Mirrors [`structurally_valid_search_selection`].
+/// reducer's submission guard admits any member of it
+/// (`engine_resolution_choices.rs`, the `NamedChoice` arm) — so
+/// `SimulationFilter` skips its clone-and-apply probe on this verdict. Mirrors
+/// [`structurally_valid_search_selection`].
+///
+/// The verdict is the submission guard's, not the apply's: an admitted answer
+/// can still fail later in the action, as a life gain the engine cannot
+/// represent does (`EngineError::LifeChangeUnrepresentable`).
 ///
 /// This is load-bearing for creature-type prompts: each of the several hundred
 /// enumerated answers (one per known creature type) paid a full `GameState`
-/// clone, which is costly on a large board, to re-derive a verdict that
-/// membership alone decides.
+/// clone, which is costly on a large board, to re-derive the guard's verdict,
+/// which membership alone decides.
 ///
 /// CR 601.2f + CR 601.2h + CR 602.2b: while a cast or activation is in progress
 /// (`GameState::withholds_priority`), an answer precedes determining and paying

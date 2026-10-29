@@ -873,6 +873,12 @@ pub struct PlannerServices<'a> {
     /// `EachCandidate` unless the caller takes on what `AtSubmission` leaves
     /// to it; the root scorer sets it from its own caller.
     pub(crate) prompt_answers: PromptAnswerValidation,
+    /// Under `PromptAnswerValidation::AtSubmission`, the first root-beam answer
+    /// the legality gate admitted without simulating it whose simulation on the
+    /// root search's first rung failed. The search then stops after that rung,
+    /// because its beam holds an answer `EachCandidate` would have rejected,
+    /// and the root scorer scores the decision again under `EachCandidate`.
+    pub(crate) failed_admitted_answer: Option<GameAction>,
 }
 
 impl<'a> PlannerServices<'a> {
@@ -962,6 +968,7 @@ impl<'a> PlannerServices<'a> {
             node_contexts: HashMap::new(),
             memo_witness: SearchMemoWitness::default(),
             prompt_answers: PromptAnswerValidation::EachCandidate,
+            failed_admitted_answer: None,
         }
     }
 
@@ -1208,12 +1215,13 @@ impl<'a> PlannerServices<'a> {
             // Mulligan as the complete legal set; neither can fail apply_as_current.
             // Skipping the clone+simulate eliminates ~2 state clones per mulligan step.
             engine::types::actions::GameAction::MulliganDecision { .. } => true,
-            // CR 608.2d + CR 701.23a: a named-choice answer from the prompt's
+            // CR 608.2d + CR 614.12a + CR 701.23a: a named-choice answer from the prompt's
             // enumerated domain, or a library search selection, is admitted by
             // its submission guard without mutating the game; the engine decides that
             // through the same authority `SimulationFilter` consults before its
             // probe. Under `PromptAnswerValidation::AtSubmission` no state copy is
-            // made here: the caller simulates the one answer it submits. A shape
+            // made here: the root search simulates the answers in its beam, and
+            // the caller the one answer it submits. A shape
             // the authority declines (a scoped search, a card name, a free-entry
             // number, an answer given while a cast or activation is in progress),
             // and every answer under `EachCandidate`, is simulated below.
@@ -1890,10 +1898,14 @@ pub(crate) enum PromptAnswerValidation {
     /// Simulate each answer on a state copy, as the gate's catch-all does. The
     /// gate's verdict is final.
     EachCandidate,
-    /// Admit the answer without a state copy. The caller must simulate the one
-    /// answer it submits ([`PlannerServices::simulation_accepts`]) and, if that
-    /// simulation fails, decide again under `EachCandidate`. Only the canonical
-    /// chooser (`search::choose_action_with_session_inner`) does both.
+    /// Admit the answer without a state copy. The root search simulates each
+    /// such answer in its beam on its first rung and, if one fails, the root
+    /// scorer scores the decision again under `EachCandidate`
+    /// ([`PlannerServices::failed_admitted_answer`]). The caller must simulate
+    /// the one answer it submits ([`PlannerServices::simulation_accepts`]) and,
+    /// if that simulation fails, decide again under `EachCandidate`. Only the
+    /// canonical chooser (`search::choose_action_with_session_inner`) does
+    /// both.
     AtSubmission,
 }
 
@@ -1908,24 +1920,33 @@ impl PromptAnswerValidation {
         }
     }
 
-    /// The validation the canonical chooser decides under first.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn for_chooser() -> Self {
-        if CHOOSER_SIMULATES_EACH_PROMPT_ANSWER.get() {
+    /// The validation the canonical chooser decides under first:
+    /// `AtSubmission`, unless `config` scores the decision in determinized
+    /// samples (`determinization_samples > 0`). Each sample simulates every
+    /// answer itself (`search::score_candidates_core`), so a simulation of the
+    /// submitted answer could not change the decision.
+    pub(crate) fn for_chooser(config: &AiConfig) -> Self {
+        if config.search.determinization_samples > 0 || chooser_simulates_each_prompt_answer() {
             Self::EachCandidate
         } else {
             Self::AtSubmission
         }
     }
+}
 
-    /// Production variant: the chooser always decides under `AtSubmission`
-    /// first.
-    #[cfg(not(test))]
-    #[inline]
-    pub(crate) fn for_chooser() -> Self {
-        Self::AtSubmission
-    }
+/// Whether this thread's chooser is switched to `EachCandidate` for a test's
+/// reference decision.
+#[cfg(test)]
+#[inline]
+fn chooser_simulates_each_prompt_answer() -> bool {
+    CHOOSER_SIMULATES_EACH_PROMPT_ANSWER.get()
+}
+
+/// Production variant: the switch does not exist.
+#[cfg(not(test))]
+#[inline]
+fn chooser_simulates_each_prompt_answer() -> bool {
+    false
 }
 
 // Test-only switch for the chooser's first validation, so a production-path
@@ -4545,12 +4566,22 @@ mod tests {
     /// wall-clock deadline), with the AI's RNG seeded from the same run seed
     /// and a fresh session. Panics if the engine rejects the action.
     fn run_ai_decision(prompt: &GameState) -> AiDecision {
-        const SEED: u64 = 0;
-        let config = create_config_for_players(AiDifficulty::Medium, Platform::Native, 2)
-            .into_measurement(SEED);
+        run_ai_decision_with(
+            prompt,
+            create_config_for_players(AiDifficulty::Medium, Platform::Native, 2)
+                .into_measurement(AI_DECISION_SEED),
+        )
+    }
+
+    /// The run seed of every AI decision these tests take: the seat's RNG is
+    /// seeded from it, as is a measurement-mode seat configuration.
+    const AI_DECISION_SEED: u64 = 0;
+
+    /// [`run_ai_decision`] for a seat configured as `config`.
+    fn run_ai_decision_with(prompt: &GameState, config: AiConfig) -> AiDecision {
         let ai_configs = HashMap::from([(P0, config)]);
         let ai_players = HashSet::from([P0]);
-        let mut rng = StdRng::seed_from_u64(SEED);
+        let mut rng = StdRng::seed_from_u64(AI_DECISION_SEED);
         let session = AiSession::arc_from_game(prompt);
         let mut state = prompt.clone();
         perf_counters::reset();
@@ -4691,14 +4722,16 @@ mod tests {
     /// rules set no maximum), controlling one creature of each of five types.
     /// Each of those types would gain 2 life, a total outside that range, so
     /// its apply returns `EngineError::LifeChangeUnrepresentable`; every other
-    /// type gains no life and applies. The five fill the Medium root beam, so
-    /// the AI selects one of them first. The driver's simulation of that answer
-    /// fails, the decision is taken again with every type simulated, and the AI
+    /// type gains no life and applies. The five fill the Medium root beam, and
+    /// the root search's simulation of each fails, so the decision is scored
+    /// again with every type simulated before anything is selected. The AI
     /// submits the type, and leaves its RNG where, the simulate-every-answer
-    /// gate does.
+    /// gate does, and the driver simulates that type once more before
+    /// submitting it.
     ///
-    /// Fails without the chooser's submission check: the AI then submits the
-    /// rejected type and `run_ai_action` stops with `ApplyFailed`.
+    /// Fails if nothing simulates an admitted answer before it is submitted:
+    /// the AI then submits a rejected type and `run_ai_action` stops with
+    /// `ApplyFailed`.
     #[test]
     fn ai_driver_replaces_a_submitted_creature_type_the_engine_rejects() {
         const CONTROLLED: [&str; 5] = ["Elf", "Goblin", "Human", "Merfolk", "Zombie"];
@@ -4756,7 +4789,8 @@ mod tests {
         assert_eq!(
             decision.clones,
             offered + 1,
-            "the submitted type's simulation fails, then every offered type is simulated"
+            "the root search rejects the beam's types, every offered type is then \
+             simulated, and the submitted one once more"
         );
         assert_eq!(
             decision.action, reference.action,
@@ -4790,6 +4824,236 @@ mod tests {
             "P0 must receive priority after Luminescent Rain resolves, got {:?}",
             decision.after.waiting_for
         );
+    }
+
+    /// Luminescent Rain ("Choose a creature type. You gain 2 life for each
+    /// permanent you control of that type.") cast by a P0 one life below the
+    /// largest life total the engine represents (`i32::MAX`), controlling one
+    /// creature of each type in `controlled`, resolved up to its creature-type
+    /// prompt offering every CR 205.3m type. Asserts the fixture: each
+    /// controlled type passes the structural check and its apply returns
+    /// `EngineError::LifeChangeUnrepresentable` (2 more life is outside that
+    /// range; CR 119.3 adjusts a life total by what is gained, and the rules set
+    /// no maximum), and a type P0 controls no permanent of gains no life and
+    /// applies.
+    fn luminescent_rain_prompt_rejecting(controlled: &[&str]) -> GameState {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_life(P0, i32::MAX - 1);
+        for subtype in controlled {
+            scenario
+                .add_creature(P0, &format!("{subtype} A"), 1, 1)
+                .with_subtypes(vec![*subtype]);
+        }
+        let rain = add_creature_type_spell(
+            &mut scenario,
+            "Luminescent Rain",
+            true,
+            LUMINESCENT_RAIN_ORACLE,
+            ManaCost::Cost {
+                generic: 2,
+                shards: vec![ManaCostShard::Green],
+            },
+            &[ManaType::Colorless, ManaType::Colorless, ManaType::Green],
+        );
+        let prompt = prompt_offering_every_creature_type(scenario.build(), rain);
+        for subtype in controlled {
+            let answer = choose(subtype);
+            assert!(
+                engine::ai_support::structurally_valid_prompt_answer(&prompt, &answer),
+                "{subtype} is an offered creature type"
+            );
+            let mut sim = prompt.clone();
+            let applied = apply_as_current_for_simulation(&mut sim, answer);
+            assert!(
+                matches!(
+                    applied,
+                    Err(EngineError::LifeChangeUnrepresentable { player }) if player == P0
+                ),
+                "{subtype}: 2 more life is outside the engine's range, got {applied:?}"
+            );
+        }
+        assert!(
+            planner_simulation_accepts(&prompt, &choose("Advisor")),
+            "a type P0 controls no permanent of gains no life and applies"
+        );
+        prompt
+    }
+
+    /// Production path where the root beam holds answers the engine rejects
+    /// beside one it accepts: Luminescent Rain for a P0 at `i32::MAX - 1` life
+    /// controlling one creature of each of four types. Those four types would
+    /// each gain life past the engine's range, so their applies fail; they
+    /// outrank every other type and take four of the Medium beam's five places,
+    /// and the fifth is a type P0 controls no permanent of, which applies. The
+    /// root search simulates the beam and finds the four rejected, so the
+    /// decision is scored again with every type simulated before anything is
+    /// selected: the AI submits the type, and leaves its RNG where, the
+    /// simulate-every-answer gate does, whose beam holds five accepted types.
+    ///
+    /// Fails if only a selected answer that fails is replaced: the AI then
+    /// selects the one accepted type of the crowded beam.
+    #[test]
+    fn ai_driver_scores_again_when_its_root_search_rejects_an_admitted_type() {
+        const CONTROLLED: [&str; 4] = ["Elf", "Goblin", "Human", "Merfolk"];
+        let prompt = luminescent_rain_prompt_rejecting(&CONTROLLED);
+        let offered = named_options(&prompt).len() as u64;
+
+        let decision = run_ai_decision(&prompt);
+        let reference = run_reference_ai_decision(&prompt);
+        assert_eq!(
+            reference.clones, offered,
+            "reach guard: the simulate-every-answer gate copies the state once per offered type"
+        );
+        assert_eq!(
+            decision.action, reference.action,
+            "the AI must submit the creature type the simulate-every-answer gate picks"
+        );
+        assert_eq!(
+            decision.next_draw, reference.next_draw,
+            "the decision must draw from the AI's RNG exactly as that gate's decision does"
+        );
+        assert_eq!(
+            decision.clones,
+            offered + 1,
+            "the root search rejects the beam's admitted types, every offered type is then \
+             simulated, and the submitted one once more"
+        );
+
+        // Luminescent Rain resolved with an accepted type: none of P0's, so no
+        // life is gained, and P0 as the active player receives priority again
+        // (CR 117.3b).
+        let GameAction::ChooseOption { choice } = &decision.action else {
+            panic!(
+                "the AI must answer the creature-type prompt, got {:?}",
+                decision.action
+            );
+        };
+        assert!(
+            !CONTROLLED.contains(&choice.as_str()),
+            "the AI must not submit a rejected type, got {choice}"
+        );
+        assert_eq!(seat(&decision.after, P0).life, i32::MAX - 1);
+        assert!(
+            decision.after.stack.is_empty(),
+            "Luminescent Rain must finish resolving"
+        );
+        assert!(
+            matches!(decision.after.waiting_for, WaitingFor::Priority { player } if player == P0),
+            "P0 must receive priority after Luminescent Rain resolves, got {:?}",
+            decision.after.waiting_for
+        );
+    }
+
+    /// Production path where nothing simulates the beam before selection: the
+    /// Luminescent Rain board whose five rejected types fill the Medium root
+    /// beam, decided by a seat whose root search has no time
+    /// (`time_budget_ms: Some(0)`), so its deadline has expired before the
+    /// search's first rung and the beam is scored by the tactical floor alone.
+    /// The AI selects a rejected type, the driver's simulation of it fails, and
+    /// the decision is taken again with every type simulated, from the same
+    /// selection draw and under the same expired deadline: the AI submits the
+    /// type, and leaves its RNG where, the simulate-every-answer gate does.
+    ///
+    /// Fails without the chooser's submission check: the AI then submits the
+    /// rejected type and `run_ai_action` stops with `ApplyFailed`.
+    #[test]
+    fn ai_driver_replaces_a_rejected_type_it_selects_before_any_search() {
+        const CONTROLLED: [&str; 5] = ["Elf", "Goblin", "Human", "Merfolk", "Zombie"];
+        let prompt = luminescent_rain_prompt_rejecting(&CONTROLLED);
+        let offered = named_options(&prompt).len() as u64;
+        let mut config = create_config_for_players(AiDifficulty::Medium, Platform::Native, 2);
+        config.search.time_budget_ms = Some(0);
+        assert!(
+            !config.execution_mode.is_measurement() && config.search.enabled,
+            "fixture: a searching seat whose wall-clock budget is spent before the search"
+        );
+
+        let decision = run_ai_decision_with(&prompt, config.clone());
+        let reference = {
+            let _each_candidate = ChooserSimulatesEachPromptAnswer::enter();
+            run_ai_decision_with(&prompt, config)
+        };
+        assert_eq!(
+            reference.clones, offered,
+            "reach guard: the simulate-every-answer gate copies the state once per offered type"
+        );
+        assert_eq!(
+            decision.clones,
+            offered + 1,
+            "the selected type's simulation fails, then every offered type is simulated"
+        );
+        assert_eq!(
+            decision.action, reference.action,
+            "the AI must submit the creature type the simulate-every-answer gate picks"
+        );
+        assert_eq!(
+            decision.next_draw, reference.next_draw,
+            "the decision must draw from the AI's RNG exactly as that gate's decision does"
+        );
+        let GameAction::ChooseOption { choice } = &decision.action else {
+            panic!(
+                "the AI must answer the creature-type prompt, got {:?}",
+                decision.action
+            );
+        };
+        assert!(
+            !CONTROLLED.contains(&choice.as_str()),
+            "the AI must not submit a rejected type, got {choice}"
+        );
+        assert_eq!(seat(&decision.after, P0).life, i32::MAX - 1);
+        assert!(
+            decision.after.stack.is_empty(),
+            "Luminescent Rain must finish resolving"
+        );
+        assert!(
+            matches!(decision.after.waiting_for, WaitingFor::Priority { player } if player == P0),
+            "P0 must receive priority after Luminescent Rain resolves, got {:?}",
+            decision.after.waiting_for
+        );
+    }
+
+    /// Production path with determinized sampling (`determinization_samples >
+    /// 0`): every sampled world simulates each answer it scores, so the chooser
+    /// decides under `PromptAnswerValidation::EachCandidate` from the start and
+    /// simulates nothing more for the answer it submits. Distant Melody's
+    /// creature-type prompt then costs one state copy per offered type per
+    /// sampled world, and the AI submits the type, and leaves its RNG where,
+    /// the simulate-every-answer gate does.
+    ///
+    /// Fails if the chooser still simulates the answer it submits (one copy
+    /// more).
+    #[test]
+    fn chooser_scoring_sampled_worlds_does_not_simulate_its_answer_again() {
+        const SAMPLES: u32 = 2;
+        let prompt = distant_melody_prompt(GameScenario::new());
+        let offered = named_options(&prompt).len() as u64;
+        let mut config = create_config_for_players(AiDifficulty::Medium, Platform::Native, 2)
+            .into_measurement(AI_DECISION_SEED);
+        config.search.determinization_samples = SAMPLES;
+
+        let decision = run_ai_decision_with(&prompt, config.clone());
+        let reference = {
+            let _each_candidate = ChooserSimulatesEachPromptAnswer::enter();
+            run_ai_decision_with(&prompt, config)
+        };
+        assert_eq!(
+            reference.clones,
+            offered * u64::from(SAMPLES),
+            "reach guard: each sampled world copies the state once per offered type"
+        );
+        assert_eq!(
+            decision.clones,
+            offered * u64::from(SAMPLES),
+            "the chooser must not simulate the answer the sampled worlds already simulated"
+        );
+        assert!(
+            matches!(decision.action, GameAction::ChooseOption { .. }),
+            "the AI must answer the creature-type prompt, got {:?}",
+            decision.action
+        );
+        assert_eq!(decision.action, reference.action);
+        assert_eq!(decision.next_draw, reference.next_draw);
     }
 
     // T2: sample_backfilled_continuations sorts by prior (desc), skips illegal

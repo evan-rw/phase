@@ -589,22 +589,35 @@ fn choose_action_with_session_inner(
     // The scored path, as one step this decision may take twice. Under
     // `PromptAnswerValidation::AtSubmission` the legality gate admits, without
     // simulating them, the named-choice answers and library search selections
-    // `structurally_valid_prompt_answer` admits, so a selected answer admitted
-    // that way is simulated before anything commits it. If
-    // that simulation fails, the decision is taken again under `EachCandidate`,
-    // the gate that simulates every answer, from the same selection draw, so it
-    // selects what that gate selects.
+    // `structurally_valid_prompt_answer` admits. The root search simulates each
+    // one in its beam on its first rung, and if one fails the scorer scores the
+    // decision again under `EachCandidate`, the gate that simulates every
+    // answer, before returning, so nothing here selects from a beam that gate
+    // would not have built. A selected answer admitted that way is simulated
+    // before anything commits it; if that simulation fails, the decision is
+    // taken again under `EachCandidate`, from the same selection draw and under
+    // the same root-search deadline, so it selects what that gate selects.
+    //
+    // Where the root search does not simulate the beam (search disabled, or a
+    // wall-clock deadline that expires before its first rung), an admitted
+    // answer that fails and is not selected stays among the scored candidates:
+    // the selection can then differ from that gate's, and can take a draw that
+    // gate's would not. An admitted answer that fails and is selected there is
+    // replaced as above, but its selection's draw is already taken, also where
+    // that gate's selection would not draw.
     let root = RootReuse::FromChooser {
         contract,
         priority_shortcut,
     };
     let mut draw = SelectionDraw::default();
+    let mut root_deadline = RootSearchDeadline::default();
     let mut score_and_select = |prompt_answers: PromptAnswerValidation| {
         let mut scored = score_candidates_uncertified(
             &root_domain,
             config,
             session,
             ensemble_deadline,
+            &mut root_deadline,
             root,
             prompt_answers,
         );
@@ -619,7 +632,7 @@ fn choose_action_with_session_inner(
         let index = softmax_select_index_with(&scored, config.temperature, || draw.uniform(rng))?;
         Some(ScoredPick { scored, index })
     };
-    let prompt_answers = PromptAnswerValidation::for_chooser();
+    let prompt_answers = PromptAnswerValidation::for_chooser(config);
     let mut pick = score_and_select(prompt_answers);
     if pick.as_ref().is_some_and(|pick| {
         prompt_answers.admits_without_simulation(state, pick.action())
@@ -680,8 +693,7 @@ impl ScoredPick {
 
 /// A decision's one softmax draw from the caller's RNG: taken the first time a
 /// selection needs it and reused by a later selection of the same decision, so
-/// a decision that selects twice consumes no more of the caller's stream than
-/// its first selection did.
+/// a decision consumes at most one draw however many times it selects.
 #[derive(Default)]
 struct SelectionDraw(Option<f64>);
 
@@ -3034,6 +3046,7 @@ pub(crate) fn score_candidates_with_session(
         config,
         session,
         deadline,
+        &mut RootSearchDeadline::default(),
         RootReuse::Fresh,
         PromptAnswerValidation::EachCandidate,
     )
@@ -3053,6 +3066,29 @@ fn ensemble_deadline(config: &AiConfig) -> engine::util::Deadline {
     match config.search.time_budget_ms {
         Some(ms) => engine::util::Deadline::after(ms),
         None => engine::util::Deadline::none(),
+    }
+}
+
+/// The wall-clock deadline of a decision's root search, kept across the passes
+/// that score one decision state. The first pass's `PlannerServices` starts it
+/// from `time_budget_ms`, as every root search does; a pass that takes the
+/// decision again (`PromptAnswerValidation`) runs under that same deadline, so
+/// retaking a decision does not restart its budget, as the determinized
+/// samples of one decision share one (`ensemble_deadline`). Measurement mode
+/// has no deadline either way (`PlannerServices::with_deadline`).
+#[derive(Debug, Default)]
+struct RootSearchDeadline(Option<engine::util::Deadline>);
+
+impl RootSearchDeadline {
+    /// The deadline an earlier pass started, if any.
+    fn shared(&self) -> Option<engine::util::Deadline> {
+        self.0
+    }
+
+    /// Keep `deadline`, the one a pass just started, unless an earlier pass
+    /// started one.
+    fn start(&mut self, deadline: engine::util::Deadline) {
+        self.0.get_or_insert(deadline);
     }
 }
 
@@ -3116,15 +3152,17 @@ thread_local! {
 
 /// [`score_candidates_with_session`] after its lethal-reach certification has
 /// declined: shortcuts and scoring only, per sampled world when K > 0.
-/// `root_domain` is the decision state's own priority domain and `root` the
-/// caller's knowledge of that state; both are forwarded only to the search that
-/// runs on the decision state itself, while every determinized sample is a
-/// different state that builds its own domain and is scored `Fresh`.
+/// `root_domain` is the decision state's own priority domain, `root_deadline`
+/// the deadline of its root search and `root` the caller's knowledge of that
+/// state; all three are forwarded only to the search that runs on the decision
+/// state itself, while every determinized sample is a different state that
+/// builds its own domain and is scored `Fresh`.
 fn score_candidates_uncertified(
     root_domain: &RootPriorityDomain<'_>,
     config: &AiConfig,
     session: &Arc<AiSession>,
     deadline: engine::util::Deadline,
+    root_deadline: &mut RootSearchDeadline,
     root: RootReuse<'_>,
     prompt_answers: PromptAnswerValidation,
 ) -> Vec<(GameAction, f64)> {
@@ -3138,6 +3176,7 @@ fn score_candidates_uncertified(
             config,
             session,
             None,
+            root_deadline,
             root,
             prompt_answers,
         );
@@ -3150,6 +3189,7 @@ fn score_candidates_uncertified(
             config,
             session,
             None,
+            root_deadline,
             root,
             prompt_answers,
         );
@@ -3803,6 +3843,7 @@ fn score_candidates_core(
         config,
         session,
         deadline_override,
+        &mut RootSearchDeadline::default(),
         RootReuse::Fresh,
         PromptAnswerValidation::EachCandidate,
     )
@@ -3832,11 +3873,14 @@ fn root_issued_candidates(
 /// the root. Under [`RootReuse::FromChooser`] the contract's candidates stand
 /// in for a second contract issue, and a priority shortcut the chooser found
 /// absent is not run again; everything else is identical to the `Fresh` path.
+/// Without a `deadline_override`, the search runs under `root_deadline`, the
+/// deadline an earlier pass over this decision state started, or starts it.
 fn score_candidates_core_for_root(
     domain: &RootPriorityDomain<'_>,
     config: &AiConfig,
     session: &Arc<AiSession>,
     deadline_override: Option<engine::util::Deadline>,
+    root_deadline: &mut RootSearchDeadline,
     root: RootReuse<'_>,
     prompt_answers: PromptAnswerValidation,
 ) -> Vec<(GameAction, f64)> {
@@ -3905,8 +3949,14 @@ fn score_candidates_core_for_root(
     let policies = PolicyRegistry::shared();
     let context = build_ai_context_with_session(state, ai_player, config, Arc::clone(session));
 
-    let mut services =
-        PlannerServices::with_deadline(ai_player, config, policies, context, deadline_override);
+    let mut services = PlannerServices::with_deadline(
+        ai_player,
+        config,
+        policies,
+        context,
+        deadline_override.or(root_deadline.shared()),
+    );
+    root_deadline.start(services.deadline);
     services.prompt_answers = prompt_answers;
 
     // Combat decisions bypass the candidate pipeline entirely — the combat AI
@@ -4033,7 +4083,29 @@ fn score_candidates_core_for_root(
             branching,
         );
 
-        run_iterative_deepening(state, ranked, tactical_weight, config, &mut services)
+        let scored = run_iterative_deepening(state, ranked, tactical_weight, config, &mut services);
+        if let Some(failed) = services.failed_admitted_answer.take() {
+            // An answer the gate admitted without simulating it
+            // (`PromptAnswerValidation::AtSubmission`) failed when the search
+            // applied it, so the beam is not the one `EachCandidate`, the gate
+            // that simulates every answer, builds. Score the decision again
+            // under that gate, under this pass's deadline, before any caller
+            // selects from these scores.
+            tracing::debug!(
+                ?failed,
+                "an admitted prompt answer failed its root simulation; scoring with every answer simulated"
+            );
+            return score_candidates_core_for_root(
+                domain,
+                config,
+                session,
+                deadline_override,
+                root_deadline,
+                root,
+                PromptAnswerValidation::EachCandidate,
+            );
+        }
+        scored
     } else {
         // Heuristic-only scoring
         let mut out: Vec<_> = gated
@@ -4099,8 +4171,10 @@ fn run_iterative_deepening(
         // Guard EVERY rung (incl. rung 0) at entry. Interactive: a pre-expired
         // deadline returns the tactical-only floor with zero applies (==
         // origin/main). Measurement: services.deadline is none() => never
-        // expires => full fixed ceiling => deterministic.
-        if services.deadline.expired() {
+        // expires => full fixed ceiling => deterministic. A rung-0 failure of an
+        // answer the gate admitted unsimulated ends the search too: the caller
+        // discards these scores and scores again.
+        if services.deadline.expired() || services.failed_admitted_answer.is_some() {
             break;
         }
         // Fresh node budget per rung sharing the one services.deadline (none()
@@ -4123,26 +4197,47 @@ fn run_iterative_deepening(
                 completed = false;
                 break;
             }
-            let score = if r.score == f64::NEG_INFINITY {
+            // Rung 0's simulation of an answer the gate admitted without
+            // simulating it (`PromptAnswerValidation::AtSubmission`) is also that
+            // answer's legality check, so it runs even for a policy Reject.
+            let unverified = iter_depth == 0
+                && services
+                    .prompt_answers
+                    .admits_without_simulation(state, &r.candidate.action);
+            let score = if r.score == f64::NEG_INFINITY && !unverified {
                 // A policy Reject: `continuation + score * tactical_weight` is −∞
                 // for every finite continuation, so the simulation cannot change it.
                 f64::NEG_INFINITY
-            } else if let Some((child, sim)) = services.successor_edge(
-                Some(root),
-                state,
-                &r.candidate,
-                r.payment_successor.clone(),
-            ) {
-                let cont = planner.evaluate_after_action_at(child, &sim, services, &mut budget);
-                let continuation = r
-                    .continuation_witness
-                    .filter(|witness| witness.is_finite())
-                    .map_or(cont, |witness| cont.max(witness));
-                continuation + (r.score * tactical_weight)
             } else {
-                // Action failed simulation — same penalty as origin/main so the
-                // AI prefers any valid alternative.
-                r.score - 1000.0
+                match services.successor_edge(
+                    Some(root),
+                    state,
+                    &r.candidate,
+                    r.payment_successor.clone(),
+                ) {
+                    // An unverified Reject that applies: the simulation was its
+                    // legality check, and its score stands.
+                    Some(_) if r.score == f64::NEG_INFINITY => f64::NEG_INFINITY,
+                    Some((child, sim)) => {
+                        let cont =
+                            planner.evaluate_after_action_at(child, &sim, services, &mut budget);
+                        let continuation = r
+                            .continuation_witness
+                            .filter(|witness| witness.is_finite())
+                            .map_or(cont, |witness| cont.max(witness));
+                        continuation + (r.score * tactical_weight)
+                    }
+                    None => {
+                        if unverified {
+                            services
+                                .failed_admitted_answer
+                                .get_or_insert_with(|| r.candidate.action.clone());
+                        }
+                        // Action failed simulation — same penalty as origin/main so the
+                        // AI prefers any valid alternative.
+                        r.score - 1000.0
+                    }
+                }
             };
             rung_scored.push((r.candidate.action.clone(), score));
         }
@@ -19393,6 +19488,7 @@ one on the bottom of your library.";
             &config,
             &session,
             None,
+            &mut RootSearchDeadline::default(),
             RootReuse::FromChooser {
                 contract: &contract,
                 priority_shortcut: RootPriorityShortcut::Recompute,
@@ -19482,6 +19578,7 @@ one on the bottom of your library.";
             &config,
             &session,
             None,
+            &mut RootSearchDeadline::default(),
             RootReuse::FromChooser {
                 contract: &contract,
                 priority_shortcut: RootPriorityShortcut::Recompute,
@@ -19510,6 +19607,7 @@ one on the bottom of your library.";
                     &config,
                     &session,
                     ensemble_deadline(&config),
+                    &mut RootSearchDeadline::default(),
                     root,
                     PromptAnswerValidation::EachCandidate,
                 ))
@@ -19541,6 +19639,69 @@ one on the bottom of your library.";
             assert_eq!(root_witnesses(), (0, 0), "{name}: reach-guard, reuse ran");
             assert_eq!(reused, fresh, "{name}: root reuse changed a score");
         }
+    }
+
+    /// A pass over a decision state whose root search an earlier pass of the
+    /// same decision started runs under that pass's deadline, not a fresh
+    /// budget: with that deadline already expired, the search stops before its
+    /// first rung exactly as under an expired `deadline_override`, and the
+    /// scores differ from a search with no deadline. A pass that starts the
+    /// root search records the deadline it runs under.
+    #[test]
+    fn a_retaken_root_search_runs_under_the_deadline_its_first_pass_started() {
+        let state = searchable_state();
+        let interactive = create_config(AiDifficulty::Hard, Platform::Native);
+        assert!(
+            !interactive.execution_mode.is_measurement() && interactive.search.enabled,
+            "fixture: a searching seat under a wall-clock budget"
+        );
+        let score = |config: &AiConfig,
+                     deadline_override: Option<engine::util::Deadline>,
+                     root_deadline: &mut RootSearchDeadline| {
+            let session = AiSession::arc_from_game(&state);
+            score_bits(&score_candidates_core_for_root(
+                &RootPriorityDomain::new(&state, PlayerId(0)),
+                config,
+                &session,
+                deadline_override,
+                root_deadline,
+                RootReuse::Fresh,
+                PromptAnswerValidation::EachCandidate,
+            ))
+        };
+
+        let mut started = RootSearchDeadline::default();
+        let _ = score(&interactive, None, &mut started);
+        assert!(
+            started
+                .shared()
+                .and_then(|deadline| deadline.remaining())
+                .is_some(),
+            "the first pass records the wall-clock deadline its root search runs under"
+        );
+
+        let searched = score(
+            &interactive.clone().into_measurement(0),
+            None,
+            &mut RootSearchDeadline::default(),
+        );
+        assert!(searched.len() >= 2, "reach guard: the root is searched");
+        let expired_override = score(
+            &interactive,
+            Some(engine::util::Deadline::after(0)),
+            &mut RootSearchDeadline::default(),
+        );
+        assert_ne!(
+            expired_override, searched,
+            "reach guard: an expired deadline stops the search before its first rung"
+        );
+        let mut expired = RootSearchDeadline::default();
+        expired.start(engine::util::Deadline::after(0));
+        assert_eq!(
+            score(&interactive, None, &mut expired),
+            expired_override,
+            "a retaken root search must run under the deadline its first pass started"
+        );
     }
 
     /// T16: Pact drafting computes the validated domain only when a scored

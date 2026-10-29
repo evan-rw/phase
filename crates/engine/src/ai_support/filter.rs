@@ -2928,7 +2928,10 @@ mod tests {
     // ------------------------------------------------------------------
     // `structurally_valid_named_choice_answer` — the sixth structural hatch.
     //
-    // Soundness condition, as for the pass-priority hatch above:
+    // The hatch decides the submission guard's verdict, not the apply's: an
+    // answer it admits can still fail later in the action (a life gain the
+    // engine cannot represent), so the condition is agreement on the fixtures
+    // below, not a general implication as for the pass-priority hatch above:
     //
     //   structurally_valid_named_choice_answer(state, action) == true
     //     ⇒ fallback_simulation(state, candidate) == true
@@ -3315,7 +3318,10 @@ mod tests {
     // `structurally_valid_prompt_answer` — the prompt-answer authority that
     // both `SimulationFilter` and phase-ai's planner legality gate consult.
     //
-    // Soundness condition, against both simulation entries:
+    // Agreement on the fixtures below, against both simulation entries (not a
+    // general implication: an admitted answer can still fail when applied, e.g.
+    // a life gain the engine cannot represent, which is why phase-ai's chooser
+    // simulates the answer it submits):
     //
     //   structurally_valid_prompt_answer(state, action) == true
     //     ⇒ fallback_simulation(state, candidate) == true
