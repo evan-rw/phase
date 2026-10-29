@@ -7828,8 +7828,12 @@ pub(crate) enum OffZoneStaticSources<'a> {
     Known(&'a OffZoneStaticSourceIds),
 }
 
-/// Visits every static-effect source: indexed battlefield and command-zone
-/// generators, then the off-zone sources found by walking the object map.
+/// Visits every static-effect source: the battlefield and command-zone
+/// generators listed in the static-source index or, while both of its buckets
+/// are empty, a direct scan of both zones that visits every battlefield object
+/// and every command-zone object `object_sources_static_from_command_zone`
+/// admits, skipping phased-out battlefield objects either way (CR 702.26b);
+/// then the off-zone sources found by walking the object map.
 pub(crate) fn for_each_static_effect_source(
     state: &GameState,
     visit: impl FnMut(&GameState, &crate::game::game_object::GameObject),
@@ -16787,7 +16791,9 @@ mod tests {
     }
 
     /// A `Known` scan of a state visits exactly what the walk visits, in the
-    /// same order, without walking the object map again.
+    /// same order, without walking the object map again. The off-zone list
+    /// leaves out a command-zone source (here a CDA), which the command loop
+    /// already visits, so the walk visits it exactly once.
     #[test]
     fn known_off_zone_static_sources_visit_what_the_scan_visits() {
         let mut state = setup();
@@ -16829,6 +16835,12 @@ mod tests {
             std::slice::from_ref(&graveyard_opt_in),
         );
         let hand_cda = source(&mut state, "Cda", Zone::Hand, std::slice::from_ref(&cda));
+        let command_cda = source(
+            &mut state,
+            "Command Cda",
+            Zone::Command,
+            std::slice::from_ref(&cda),
+        );
         let _library_plain = source(
             &mut state,
             "Plain",
@@ -16847,6 +16859,14 @@ mod tests {
                 cause: crate::game::game_object::PhaseOutCause::Directly,
             };
         StaticSourceIndex::rebuild_from_state(&mut state);
+        assert!(
+            state
+                .static_source_index
+                .command_sources
+                .contains(&command_cda),
+            "reach-guard: the command-zone CDA sits in the command zone, and the command loop \
+             reads it from the index"
+        );
 
         reset_off_zone_static_source_scan_count();
         let mut scanned = Vec::new();
@@ -16876,6 +16896,17 @@ mod tests {
                 .all(|id| scanned.contains(id)),
             "reach-guard: the battlefield, graveyard opt-in and hand CDA sources are visited: \
              {scanned:?}"
+        );
+        assert_eq!(
+            scanned.iter().filter(|&&id| id == command_cda).count(),
+            1,
+            "the command loop visits the command-zone CDA, and the off-zone arm does not visit \
+             it again: {scanned:?}"
+        );
+        assert!(
+            !ids.ids.contains(&command_cda),
+            "the off-zone list leaves out the command-zone CDA: {:?}",
+            ids.ids
         );
         let mut listed = ids.ids.clone();
         listed.sort();
