@@ -1887,7 +1887,7 @@ impl<'a> PlannerServices<'a> {
 /// admits. Every other candidate is validated the same way under both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PromptAnswerValidation {
-    /// Simulate each answer on a state copy, like every other candidate. The
+    /// Simulate each answer on a state copy, as the gate's catch-all does. The
     /// gate's verdict is final.
     EachCandidate,
     /// Admit the answer without a state copy. The caller must simulate the one

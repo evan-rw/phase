@@ -587,9 +587,10 @@ fn choose_action_with_session_inner(
     }
 
     // The scored path, as one step this decision may take twice. Under
-    // `PromptAnswerValidation::AtSubmission` the legality gate admits
-    // named-choice answers and library search selections without simulating
-    // them, so the answer selected is simulated before anything commits it. If
+    // `PromptAnswerValidation::AtSubmission` the legality gate admits, without
+    // simulating them, the named-choice answers and library search selections
+    // `structurally_valid_prompt_answer` admits, so a selected answer admitted
+    // that way is simulated before anything commits it. If
     // that simulation fails, the decision is taken again under `EachCandidate`,
     // the gate that simulates every answer, from the same selection draw, so it
     // selects what that gate selects.
