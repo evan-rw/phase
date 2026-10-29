@@ -4084,29 +4084,30 @@ fn score_candidates_core_for_root(
             branching,
         );
 
-        let scored = run_iterative_deepening(state, ranked, tactical_weight, config, &mut services);
-        if let Some(failed) = services.failed_admitted_answer.take() {
-            // An answer the gate admitted without simulating it
-            // (`PromptAnswerValidation::AtSubmission`) failed when the search
-            // applied it, so the beam is not the one `EachCandidate`, the gate
-            // that simulates every answer, builds. Score the decision again
-            // under that gate, under this pass's deadline, before any caller
-            // selects from these scores.
-            tracing::debug!(
-                ?failed,
-                "an admitted prompt answer failed its root simulation; scoring with every answer simulated"
-            );
-            return score_candidates_core_for_root(
-                domain,
-                config,
-                session,
-                deadline_override,
-                root_deadline,
-                root,
-                PromptAnswerValidation::EachCandidate,
-            );
+        match run_iterative_deepening(state, ranked, tactical_weight, config, &mut services) {
+            Ok(scored) => scored,
+            Err(FailedAdmittedAnswer(failed)) => {
+                // An answer the gate admitted without simulating it
+                // (`PromptAnswerValidation::AtSubmission`) failed when the search
+                // applied it, so the beam is not the one `EachCandidate`, the gate
+                // that simulates every answer, builds. Score the decision again
+                // under that gate, under this pass's deadline, so no caller selects
+                // from that beam.
+                tracing::debug!(
+                    ?failed,
+                    "an admitted prompt answer failed its root simulation; scoring with every answer simulated"
+                );
+                score_candidates_core_for_root(
+                    domain,
+                    config,
+                    session,
+                    deadline_override,
+                    root_deadline,
+                    root,
+                    PromptAnswerValidation::EachCandidate,
+                )
+            }
         }
-        scored
     } else {
         // Heuristic-only scoring
         let mut out: Vec<_> = gated
@@ -4127,6 +4128,15 @@ fn score_candidates_core_for_root(
     }
 }
 
+/// A root search's report that an answer the legality gate admitted without
+/// simulating it (`PromptAnswerValidation::AtSubmission`) failed its simulation
+/// on the search's first rung. Its beam is then not the one `EachCandidate`, the
+/// gate that simulates every answer, builds, so it has no scores to select
+/// from. The answer is boxed because `GameAction` is large (as in
+/// `AiActionsStop::ApplyFailed`).
+#[derive(Debug)]
+struct FailedAdmittedAnswer(Box<GameAction>);
+
 /// Runs rung-0..=ceiling iterative deepening over the pre-ranked root beam.
 /// Extracted from `score_candidates_core` so tests can construct
 /// `PlannerServices`, run the loop, and inspect witness state (`rung_stats`,
@@ -4142,13 +4152,19 @@ fn score_candidates_core_for_root(
 /// rung, so a rung reuses the root successors and the positions below them
 /// that an earlier rung already simulated. Root successors are keyed by action,
 /// so reordering the beam between rungs cannot misalign them.
+///
+/// Under `PromptAnswerValidation::AtSubmission`, rung 0's simulation of a beam
+/// answer the legality gate admitted without simulating it is also that
+/// answer's legality check. If one fails, rung 0 still completes and is
+/// recorded in `rung_stats`, no further rung runs, and the search returns the
+/// first such answer as [`FailedAdmittedAnswer`] instead of scores.
 fn run_iterative_deepening(
     state: &GameState,
     mut ranked: Vec<RankedCandidate>,
     tactical_weight: f64,
     config: &AiConfig,
     services: &mut PlannerServices<'_>,
-) -> Vec<(GameAction, f64)> {
+) -> Result<Vec<(GameAction, f64)>, FailedAdmittedAnswer> {
     // Iterative deepening: rung 0 (quiesced eval per candidate) -> ceiling.
     // Return the deepest *fully completed* rung. The deepest rung reproduces
     // origin/main's fixed-depth pass; the TT (per-decision, on `services`)
@@ -4167,15 +4183,18 @@ fn run_iterative_deepening(
         .map(|r| (r.candidate.action.clone(), r.root_score(tactical_weight)))
         .collect();
 
+    // Under `PromptAnswerValidation::AtSubmission`, the first beam answer the
+    // legality gate admitted without simulating it whose rung-0 simulation failed.
+    let mut failed_admitted_answer: Option<GameAction> = None;
     let root = services.new_search_root();
     for iter_depth in 0..=ceiling {
         // Guard EVERY rung (incl. rung 0) at entry. Interactive: a pre-expired
         // deadline returns the tactical-only floor with zero applies (==
         // origin/main). Measurement: services.deadline is none() => never
         // expires => full fixed ceiling => deterministic. A rung-0 failure of an
-        // answer the gate admitted unsimulated ends the search too: the caller
-        // discards these scores and scores again.
-        if services.deadline.expired() || services.failed_admitted_answer.is_some() {
+        // answer the gate admitted unsimulated ends the search too: it returns
+        // that failure instead of scores.
+        if services.deadline.expired() || failed_admitted_answer.is_some() {
             break;
         }
         // Fresh node budget per rung sharing the one services.deadline (none()
@@ -4230,8 +4249,7 @@ fn run_iterative_deepening(
                     }
                     None => {
                         if unverified {
-                            services
-                                .failed_admitted_answer
+                            failed_admitted_answer
                                 .get_or_insert_with(|| r.candidate.action.clone());
                         }
                         // Action failed simulation — same penalty as origin/main so the
@@ -4294,9 +4312,12 @@ fn run_iterative_deepening(
         "iterative deepening rung summary"
     );
 
+    if let Some(answer) = failed_admitted_answer {
+        return Err(FailedAdmittedAnswer(Box::new(answer)));
+    }
     let mut out = best_scored;
     out.sort_by(|a, b| a.0.cmp_stable(&b.0));
-    out
+    Ok(out)
 }
 
 /// Deterministic principal-variation selection over a completed rung's scores.
@@ -15553,7 +15574,8 @@ mod tests {
             0.1,
             &config,
             &mut hostile_services,
-        );
+        )
+        .expect("services that simulate every answer admit none unsimulated");
         let mut control_services = PlannerServices::new_default(PlayerId(0), &config, policies);
         let control_result = run_iterative_deepening(
             &state,
@@ -15568,7 +15590,8 @@ mod tests {
             0.1,
             &config,
             &mut control_services,
-        );
+        )
+        .expect("services that simulate every answer admit none unsimulated");
         assert_eq!(hostile_result[0].1, control_result[0].1);
         assert!(
             hostile_result[0].1 > -900.0,
@@ -15634,7 +15657,8 @@ mod tests {
         config.search.planner_mode = PlannerMode::BeamOnly; // ceiling 0
         let mut services = PlannerServices::new_default(PlayerId(0), &config, policies);
         let ranked = build_root_beam(&state, &services);
-        let out = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services);
+        let out = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services)
+            .expect("services that simulate every answer admit none unsimulated");
 
         assert!(!out.is_empty(), "rung 0 produces the floor");
         // Reach-guard: rung 0 ran (non-vacuous).
@@ -15679,7 +15703,8 @@ mod tests {
         let mut services =
             PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
         let ranked = vec![RankedCandidate::new(cast.clone(), f64::NEG_INFINITY)];
-        let out = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services);
+        let out = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services)
+            .expect("services that simulate every answer admit none unsimulated");
         assert_eq!(
             services.memo_witness.successor_simulations + services.memo_witness.successor_hits,
             0,
@@ -15768,7 +15793,8 @@ mod tests {
         );
         let ranked = build_root_beam(&state, &services);
         assert!(!ranked.is_empty(), "reach-guard: the beam is non-empty");
-        let out = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services);
+        let out = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services)
+            .expect("services that simulate every answer admit none unsimulated");
         assert!(!out.is_empty(), "the tactical-only floor is still returned");
         assert!(
             services.rung_stats.is_empty(),
@@ -15835,7 +15861,8 @@ mod tests {
             let mut cfg1 = config.clone();
             cfg1.search.max_depth = 2; // ceiling 1
             let mut s = PlannerServices::new_default(PlayerId(0), &cfg1, policies);
-            let rung1 = run_iterative_deepening(&state, ranked.clone(), tw, &cfg1, &mut s);
+            let rung1 = run_iterative_deepening(&state, ranked.clone(), tw, &cfg1, &mut s)
+                .expect("services that simulate every answer admit none unsimulated");
             pv_argmax(&rung1).cloned().expect("rung 1 has an argmax")
         };
         assert_ne!(b, a, "reach-guard: the PV must differ from ranked[0]");
@@ -15881,7 +15908,8 @@ mod tests {
         // Measured run: ceiling 2, pass-first beam. Rung 1 sets PV = B; rung 2
         // rotates B to the front and searches it first with the fresh per-rung pool.
         let mut services = PlannerServices::new_default(PlayerId(0), &config, policies);
-        let out = run_iterative_deepening(&state, ranked, tw, &config, &mut services);
+        let out = run_iterative_deepening(&state, ranked, tw, &config, &mut services)
+            .expect("services that simulate every answer admit none unsimulated");
 
         // TT-contamination reach-guard: the measured/control equality is TT-free.
         assert_eq!(
@@ -15939,7 +15967,8 @@ mod tests {
             let mut cfg0 = config.clone();
             cfg0.search.planner_mode = PlannerMode::BeamOnly; // ceiling 0
             let mut s = PlannerServices::new_default(PlayerId(0), &cfg0, policies);
-            let rung0 = run_iterative_deepening(&state, ranked.clone(), tw, &cfg0, &mut s);
+            let rung0 = run_iterative_deepening(&state, ranked.clone(), tw, &cfg0, &mut s)
+                .expect("services that simulate every answer admit none unsimulated");
             pv_argmax(&rung0).cloned().expect("rung 0 has an argmax")
         };
         // Reach-guard: rung-0 argmax must differ from ranked[0], else pre-rotating
@@ -15953,6 +15982,7 @@ mod tests {
         let out_natural = {
             let mut s = PlannerServices::new_default(PlayerId(0), &config, policies);
             run_iterative_deepening(&state, ranked.clone(), tw, &config, &mut s)
+                .expect("services that simulate every answer admit none unsimulated")
         };
         // Run 2: beam pre-rotated so B0 is first (mimics an un-gated rung-0 rotate).
         let out_prerotated = {
@@ -15960,6 +15990,7 @@ mod tests {
             rotate_pv_to_front(&mut pre, &b0);
             let mut s = PlannerServices::new_default(PlayerId(0), &config, policies);
             run_iterative_deepening(&state, pre, tw, &config, &mut s)
+                .expect("services that simulate every answer admit none unsimulated")
         };
 
         assert_ne!(
@@ -19060,7 +19091,8 @@ one on the bottom of your library.";
             !ranked.is_empty(),
             "reach-guard: the root beam is non-empty"
         );
-        let scored = run_iterative_deepening(state, ranked, 0.1, &config, &mut services);
+        let scored = run_iterative_deepening(state, ranked, 0.1, &config, &mut services)
+            .expect("services that simulate every answer admit none unsimulated");
         let trace = DeepeningTrace {
             scored: score_bits(&scored),
             rung_stats: services.rung_stats.clone(),

@@ -1482,10 +1482,12 @@ pub fn candidate_actions_broad_with_probe(
             // Engine-side beam cap for *combinatorial* enumerations only. The AI
             // scores every candidate returned here one selection at a time, and
             // `SimulationFilter` and phase-ai's planner legality gate simulate
-            // each one `structurally_valid_prompt_answer` defers (the gate's
-            // score-only route simulates every one), so a count=4 search against
-            // an 80-card library would produce ~C(80,4) ≈ 1.6M combinations and
-            // stall the AI for hours.
+            // each one `structurally_valid_prompt_answer` defers. The gate
+            // simulates every one on phase-ai's score-only route, in each
+            // determinized sample, and when phase-ai scores a decision again
+            // after an answer the gate admitted without simulating it fails. So
+            // a count=4 search against an 80-card library would produce
+            // ~C(80,4) ≈ 1.6M combinations and stall the AI for hours.
             // The cap is constraint-aware so
             // distinct-name searches collapse duplicate-named entries before
             // combinatorial explosion (Gifts Ungiven against an 80-card pool with
@@ -6190,7 +6192,9 @@ fn station_target_candidates(
 /// repeated names down to the unique-name set first. The cap exists strictly
 /// to bound the AI's per-selection work (scoring every issued selection, and
 /// simulating each one `structurally_valid_prompt_answer` defers, or every one
-/// on phase-ai's score-only route); without it,
+/// on phase-ai's score-only route, in each determinized sample, and when
+/// phase-ai scores a decision again after an answer its planner legality gate
+/// admitted without simulating it fails); without it,
 /// multi-card searches against large libraries stall the AI for hours. Player
 /// submissions are validated by the engine
 /// submission guard, not by this enumeration, so capping here cannot make a

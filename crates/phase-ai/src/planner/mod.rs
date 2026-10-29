@@ -873,12 +873,6 @@ pub struct PlannerServices<'a> {
     /// `EachCandidate` unless the caller takes on what `AtSubmission` leaves
     /// to it; the root scorer sets it from its own caller.
     pub(crate) prompt_answers: PromptAnswerValidation,
-    /// Under `PromptAnswerValidation::AtSubmission`, the first root-beam answer
-    /// the legality gate admitted without simulating it whose simulation on the
-    /// root search's first rung failed. The search then stops after that rung,
-    /// because its beam holds an answer `EachCandidate` would have rejected,
-    /// and the root scorer scores the decision again under `EachCandidate`.
-    pub(crate) failed_admitted_answer: Option<GameAction>,
 }
 
 impl<'a> PlannerServices<'a> {
@@ -968,7 +962,6 @@ impl<'a> PlannerServices<'a> {
             node_contexts: HashMap::new(),
             memo_witness: SearchMemoWitness::default(),
             prompt_answers: PromptAnswerValidation::EachCandidate,
-            failed_admitted_answer: None,
         }
     }
 
@@ -1899,9 +1892,9 @@ pub(crate) enum PromptAnswerValidation {
     /// gate's verdict is final.
     EachCandidate,
     /// Admit the answer without a state copy. The root search simulates each
-    /// such answer in its beam on its first rung and, if one fails, the root
-    /// scorer scores the decision again under `EachCandidate`
-    /// ([`PlannerServices::failed_admitted_answer`]). The caller must simulate
+    /// such answer in its beam on its first rung and, if one fails, returns it
+    /// (`search::FailedAdmittedAnswer`) instead of scores, and the root scorer
+    /// scores the decision again under `EachCandidate`. The caller must simulate
     /// the one answer it submits ([`PlannerServices::simulation_accepts`]) and,
     /// if that simulation fails, decide again under `EachCandidate`. Only the
     /// canonical chooser (`search::choose_action_with_session_inner`) does
@@ -2271,6 +2264,7 @@ mod tests {
 
     use crate::auto_play::run_ai_action;
     use crate::config::{create_config, create_config_for_players, AiDifficulty, Platform};
+    use crate::policies::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
     use crate::session::AiSession;
 
     fn make_state() -> GameState {
@@ -3786,7 +3780,7 @@ mod tests {
     /// from the card text and the rules, or, on a board a row mutates after the
     /// pipeline, from that mutated prompt.
     ///
-    /// The two scope rows answer `ChooseOption` at Celestial Reunion's
+    /// The scope rows answer `ChooseOption` at Celestial Reunion's
     /// `CostTypeChoice` and `SelectCards` at Cultivate's
     /// `SearchPartitionChoice` — windows other than `NamedChoice` /
     /// `SearchChoice`. They fail if `structurally_valid_prompt_answer`'s window
@@ -4584,10 +4578,18 @@ mod tests {
 
     /// [`run_ai_decision`] for a seat configured as `config`.
     fn run_ai_decision_with(prompt: &GameState, config: AiConfig) -> AiDecision {
+        run_ai_decision_in(prompt, config, AiSession::arc_from_game(prompt))
+    }
+
+    /// [`run_ai_decision_with`] in `session`, a session fresh for `prompt`.
+    fn run_ai_decision_in(
+        prompt: &GameState,
+        config: AiConfig,
+        session: Arc<AiSession>,
+    ) -> AiDecision {
         let ai_configs = HashMap::from([(P0, config)]);
         let ai_players = HashSet::from([P0]);
         let mut rng = StdRng::seed_from_u64(AI_DECISION_SEED);
-        let session = AiSession::arc_from_game(prompt);
         let mut state = prompt.clone();
         perf_counters::reset();
         let step = run_ai_action(&mut state, &ai_players, &ai_configs, &mut rng, &session);
@@ -4611,6 +4613,63 @@ mod tests {
     fn run_reference_ai_decision(prompt: &GameState) -> AiDecision {
         let _each_candidate = ChooserSimulatesEachPromptAnswer::enter();
         run_ai_decision(prompt)
+    }
+
+    /// The first `count` values the AI's RNG yields, seeded as each decision here
+    /// seeds it. A selection's draw (`rng.random::<f64>()`) advances the stream by
+    /// one `u64`, so a decision that took `n` draws reports `seat_draws(n + 1)[n]`
+    /// as its `next_draw`.
+    fn seat_draws(count: usize) -> Vec<u64> {
+        let mut rng = StdRng::seed_from_u64(AI_DECISION_SEED);
+        (0..count).map(|_| rng.random()).collect()
+    }
+
+    /// A tactical policy that rejects every named-choice answer (`ChooseOption`)
+    /// except those naming one of `except`, and is neutral on everything else.
+    /// Installed as a session's whole registry (`AiSession::policy_registry_override`),
+    /// it makes each rejected answer's tactical score −∞ (`PolicyRegistry::score`):
+    /// the only way to put a policy-rejected prompt answer in front of the scorer.
+    #[derive(Clone, Copy)]
+    struct RejectsNamedChoices {
+        except: &'static [&'static str],
+    }
+
+    impl TacticalPolicy for RejectsNamedChoices {
+        fn id(&self) -> PolicyId {
+            PolicyId::CreatureTypeChoice
+        }
+
+        fn decision_kinds(&self) -> &'static [DecisionKind] {
+            // `decision_kind::classify` routes a `NamedChoice` answer here.
+            &[DecisionKind::ActivateAbility]
+        }
+
+        fn activation(
+            &self,
+            _: &crate::features::DeckFeatures,
+            _: &GameState,
+            _: PlayerId,
+        ) -> Option<f32> {
+            Some(1.0)
+        }
+
+        fn verdict(&self, context: &PolicyContext<'_>) -> PolicyVerdict {
+            let reason = PolicyReason::new("rejects_named_choices_test");
+            match &context.candidate.action {
+                GameAction::ChooseOption { choice } if !self.except.contains(&choice.as_str()) => {
+                    PolicyVerdict::reject(reason)
+                }
+                _ => PolicyVerdict::neutral(reason),
+            }
+        }
+    }
+
+    /// A fresh session for `prompt` whose scorer consults `policy` alone.
+    fn session_scoring_with(prompt: &GameState, policy: RejectsNamedChoices) -> Arc<AiSession> {
+        let mut session = AiSession::from_game(prompt);
+        session.policy_registry_override =
+            Some(Arc::new(PolicyRegistry::for_tests(vec![Box::new(policy)])));
+        Arc::new(session)
     }
 
     fn seat(state: &GameState, player: PlayerId) -> &engine::types::player::Player {
@@ -5014,6 +5073,175 @@ mod tests {
         assert!(
             matches!(decision.after.waiting_for, WaitingFor::Priority { player } if player == P0),
             "P0 must receive priority after Luminescent Rain resolves, got {:?}",
+            decision.after.waiting_for
+        );
+    }
+
+    /// Production path where the root beam holds an answer both a policy and the
+    /// engine reject: Luminescent Rain ("Choose a creature type. You gain 2 life
+    /// for each permanent you control of that type.") for a P0 at `i32::MAX - 1`
+    /// life controlling one Ally, decided by a Medium seat whose only policy
+    /// rejects every creature type. Every type then scores −∞, so the root beam is
+    /// the first five types in the stable action order (Advisor, Aetherborn, Alien,
+    /// Ally, Angel). Ally's apply fails: 2 more life is outside the engine's range
+    /// (CR 119.3 adjusts a life total by what is gained, and the rules set no
+    /// maximum). The root search's first rung simulates each admitted answer in its
+    /// beam although a policy rejects it, finds Ally rejected, and the decision is
+    /// scored again with every type simulated before anything is selected. That
+    /// gate's beam (Advisor, Aetherborn, Alien, Angel, Antelope) is all −∞, so its
+    /// selection takes no draw and falls back to the last row in the stable order,
+    /// Antelope, which the driver simulates once more before submitting it.
+    ///
+    /// Fails if the first rung skips a rejected admitted answer: the AI then
+    /// selects Angel from the beam that holds Ally, after one state copy.
+    #[test]
+    fn ai_driver_scores_again_when_a_policy_rejected_beam_type_fails() {
+        const CONTROLLED: [&str; 1] = ["Ally"];
+        let rejects_every_type = RejectsNamedChoices { except: &[] };
+        let prompt = luminescent_rain_prompt_rejecting(&CONTROLLED);
+        let offered = named_options(&prompt).len() as u64;
+        let config = create_config_for_players(AiDifficulty::Medium, Platform::Native, 2)
+            .into_measurement(AI_DECISION_SEED);
+
+        let decision = run_ai_decision_in(
+            &prompt,
+            config.clone(),
+            session_scoring_with(&prompt, rejects_every_type),
+        );
+        let reference = {
+            let _each_candidate = ChooserSimulatesEachPromptAnswer::enter();
+            run_ai_decision_in(
+                &prompt,
+                config,
+                session_scoring_with(&prompt, rejects_every_type),
+            )
+        };
+        assert_eq!(
+            reference.clones, offered,
+            "reach guard: the simulate-every-answer gate copies the state once per offered type"
+        );
+        assert_eq!(
+            reference.next_draw,
+            seat_draws(1)[0],
+            "reach guard: the policy rejects every type, so no row has a finite weight and the selection takes no draw"
+        );
+        assert_eq!(
+            reference.action,
+            choose("Antelope"),
+            "reach guard: that gate's beam is the first five accepted types in the stable order, and its selection falls back to the last"
+        );
+        assert_eq!(
+            decision.clones,
+            offered + 1,
+            "the first rung simulates the policy-rejected Ally in the beam and finds it rejected, every offered type is then simulated, and the submitted one once more"
+        );
+        assert_eq!(
+            decision.action, reference.action,
+            "the AI must submit the creature type the simulate-every-answer gate picks"
+        );
+        assert_eq!(
+            decision.next_draw, reference.next_draw,
+            "the decision must draw from the AI's RNG exactly as that gate's decision does"
+        );
+        assert_eq!(seat(&decision.after, P0).life, i32::MAX - 1);
+        assert!(
+            decision.after.stack.is_empty(),
+            "Luminescent Rain must finish resolving"
+        );
+        assert!(
+            matches!(decision.after.waiting_for, WaitingFor::Priority { player } if player == P0),
+            "P0 must receive priority after Luminescent Rain resolves (CR 117.3b), got {:?}",
+            decision.after.waiting_for
+        );
+    }
+
+    /// Production path on a seat with search disabled (Easy;
+    /// `create_config_for_players` also disables it at Medium or below for five or
+    /// more players), so no root search simulates the scored answers and the
+    /// chooser's check of the answer it selects is the only simulation of an
+    /// admitted answer before submission. Luminescent Rain ("Choose a creature
+    /// type. You gain 2 life for each permanent you control of that type.") for a
+    /// P0 at `i32::MAX - 1` life controlling one creature of each of five types,
+    /// scored by a policy that rejects every type except those five. Each of the
+    /// five would gain life past the engine's range (CR 119.3 sets no maximum), so
+    /// its apply fails. They are the only rows with a finite score, so the
+    /// only rows with a nonzero selection weight, and the selection draws once
+    /// and selects one of them. The driver's simulation of it
+    /// fails, and the decision is taken again with every type simulated: the five
+    /// are gone, every remaining row is −∞, and the selection falls back to the
+    /// last type in the stable order, Zubera, without another draw. The
+    /// simulate-every-answer gate selects Zubera too, without any draw, so the
+    /// decision leaves the AI's RNG one draw ahead of that gate's, as the chooser
+    /// states for a seat whose root search does not simulate the beam.
+    ///
+    /// Fails if the chooser checks the answer it selects only on a searching seat:
+    /// the AI then submits a rejected type and `run_ai_action` stops with
+    /// `ApplyFailed`.
+    #[test]
+    fn ai_driver_without_search_replaces_a_rejected_type_it_selects() {
+        const CONTROLLED: [&str; 5] = ["Elf", "Goblin", "Human", "Merfolk", "Zombie"];
+        let rejects_all_but_controlled = RejectsNamedChoices {
+            except: &CONTROLLED,
+        };
+        let prompt = luminescent_rain_prompt_rejecting(&CONTROLLED);
+        let offered = named_options(&prompt).len() as u64;
+        let config = create_config_for_players(AiDifficulty::Easy, Platform::Native, 2)
+            .into_measurement(AI_DECISION_SEED);
+        assert!(
+            !config.search.enabled
+                && PromptAnswerValidation::for_chooser(&config)
+                    == PromptAnswerValidation::AtSubmission,
+            "fixture: a seat that scores without search and decides under `AtSubmission`"
+        );
+
+        let decision = run_ai_decision_in(
+            &prompt,
+            config.clone(),
+            session_scoring_with(&prompt, rejects_all_but_controlled),
+        );
+        let reference = {
+            let _each_candidate = ChooserSimulatesEachPromptAnswer::enter();
+            run_ai_decision_in(
+                &prompt,
+                config,
+                session_scoring_with(&prompt, rejects_all_but_controlled),
+            )
+        };
+        let draws = seat_draws(2);
+        assert_eq!(
+            reference.clones, offered,
+            "reach guard: the simulate-every-answer gate copies the state once per offered type"
+        );
+        assert_eq!(
+            reference.next_draw, draws[0],
+            "reach guard: without the five rejected types every row is rejected, so that gate's selection takes no draw"
+        );
+        assert_eq!(
+            reference.action,
+            choose("Zubera"),
+            "reach guard: that gate's selection falls back to the last type in the stable order"
+        );
+        assert_eq!(
+            decision.clones,
+            offered + 1,
+            "the selected type's simulation fails, then every offered type is simulated"
+        );
+        assert_eq!(
+            decision.action, reference.action,
+            "the AI must submit the creature type the simulate-every-answer gate picks"
+        );
+        assert_eq!(
+            decision.next_draw, draws[1],
+            "the decision's first selection draws once, where that gate's selection draws none"
+        );
+        assert_eq!(seat(&decision.after, P0).life, i32::MAX - 1);
+        assert!(
+            decision.after.stack.is_empty(),
+            "Luminescent Rain must finish resolving"
+        );
+        assert!(
+            matches!(decision.after.waiting_for, WaitingFor::Priority { player } if player == P0),
+            "P0 must receive priority after Luminescent Rain resolves (CR 117.3b), got {:?}",
             decision.after.waiting_for
         );
     }

@@ -355,8 +355,10 @@ pub(crate) fn structurally_valid_named_choice_answer(
 ///
 /// Only prompt-answer shapes with that property belong here. The other
 /// `SimulationFilter` hatches (pass, convoke payment, priority activation and
-/// cast) are scoped to that filter's own probe, and the planner keeps
-/// simulating those candidates.
+/// cast) are scoped to that filter's own probe. The planner legality gate in
+/// phase-ai does not consult them: it admits a pass during
+/// `WaitingFor::Priority` by its own arm, without simulating it, and simulates
+/// the convoke payment, activation and cast candidates it validates.
 ///
 /// Conservative by design: `false` only costs a simulation.
 pub fn structurally_valid_prompt_answer(state: &GameState, action: &GameAction) -> bool {
