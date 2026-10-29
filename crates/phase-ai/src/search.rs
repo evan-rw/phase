@@ -590,14 +590,15 @@ fn choose_action_with_session_inner(
     // The scored path, as one step this decision may take twice. Under
     // `PromptAnswerValidation::AtSubmission` the legality gate admits, without
     // simulating them, the named-choice answers and library search selections
-    // `structurally_valid_prompt_answer` admits. The root search simulates each
-    // one in its beam on its first rung, and if one fails the scorer scores the
-    // decision again under `EachCandidate`, the gate that simulates every
-    // answer, before returning, so nothing here selects from a beam that gate
-    // would not have built. A selected answer admitted that way is simulated
-    // before anything commits it; if that simulation fails, the decision is
-    // taken again under `EachCandidate`, from the same selection draw and under
-    // the same root-search deadline, so it selects what that gate selects.
+    // `structurally_valid_prompt_answer` admits. The root search simulates the
+    // ones in its beam on its first rung, in beam order, and at the first that
+    // fails the scorer scores the decision again under `EachCandidate`, the
+    // gate that simulates every answer, before returning, so nothing here
+    // selects from a beam that gate would not have built. A selected answer
+    // admitted that way is simulated before anything commits it; if that
+    // simulation fails, the decision is taken again under `EachCandidate`, from
+    // the same selection draw and under the same root-search deadline, so it
+    // selects what that gate selects.
     //
     // Where the root search does not simulate the beam (search disabled, or a
     // wall-clock deadline that expires before its first rung), an admitted
@@ -3149,6 +3150,11 @@ thread_local! {
     static FETCH_ROUTE_DOMAIN_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Times Pact drafting computed the validated domain.
     static PACT_DRAFT_DOMAIN_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The deadline each `score_candidates_core_for_root` call that builds its
+    /// search services runs under (`PlannerServices::deadline`), in call order.
+    /// `pub(crate)` so the driver tests in `planner::tests` read it.
+    pub(crate) static ROOT_SEARCH_DEADLINES: std::cell::RefCell<Vec<engine::util::Deadline>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// [`score_candidates_with_session`] after its lethal-reach certification has
@@ -3958,6 +3964,8 @@ fn score_candidates_core_for_root(
         deadline_override.or(root_deadline.shared()),
     );
     root_deadline.start(services.deadline);
+    #[cfg(test)]
+    ROOT_SEARCH_DEADLINES.with_borrow_mut(|deadlines| deadlines.push(services.deadline));
     services.prompt_answers = prompt_answers;
 
     // Combat decisions bypass the candidate pipeline entirely — the combat AI
@@ -4144,9 +4152,9 @@ struct FailedAdmittedAnswer(Box<GameAction>);
 /// `search_value` calls. The pre-rung tactical-only floor, the rung loop, and
 /// the acceptance logic all live here; `score_candidates_core` just delegates.
 ///
-/// PV threading (D2) and the rung witness (D3) are the only additions over the
-/// pre-extraction behavior; both are no-ops for `rung_stats`/ordering when the
-/// beam is a single candidate or the killers are empty.
+/// After each searched rung it accepts, the loop moves that rung's best
+/// candidate to the front of the beam for the next rung (PV threading, D2),
+/// and it records every rung it runs in `rung_stats` (the rung witness, D3).
 ///
 /// `state` becomes one tracked search root for the whole call, shared by every
 /// rung, so a rung reuses the root successors and the positions below them
@@ -4155,9 +4163,10 @@ struct FailedAdmittedAnswer(Box<GameAction>);
 ///
 /// Under `PromptAnswerValidation::AtSubmission`, rung 0's simulation of a beam
 /// answer the legality gate admitted without simulating it is also that
-/// answer's legality check. If one fails, rung 0 still completes and is
-/// recorded in `rung_stats`, no further rung runs, and the search returns the
-/// first such answer as [`FailedAdmittedAnswer`] instead of scores.
+/// answer's legality check. If one fails, rung 0 stops at that answer, without
+/// simulating or evaluating the beam answers after it, and is recorded in
+/// `rung_stats` as not completed; no further rung runs, and the search returns
+/// that answer as [`FailedAdmittedAnswer`] instead of scores.
 fn run_iterative_deepening(
     state: &GameState,
     mut ranked: Vec<RankedCandidate>,
@@ -4191,10 +4200,8 @@ fn run_iterative_deepening(
         // Guard EVERY rung (incl. rung 0) at entry. Interactive: a pre-expired
         // deadline returns the tactical-only floor with zero applies (==
         // origin/main). Measurement: services.deadline is none() => never
-        // expires => full fixed ceiling => deterministic. A rung-0 failure of an
-        // answer the gate admitted unsimulated ends the search too: it returns
-        // that failure instead of scores.
-        if services.deadline.expired() || failed_admitted_answer.is_some() {
+        // expires => full fixed ceiling => deterministic.
+        if services.deadline.expired() {
             break;
         }
         // Fresh node budget per rung sharing the one services.deadline (none()
@@ -4212,7 +4219,8 @@ fn run_iterative_deepening(
         for r in &ranked {
             // Rungs >= 1 may bail mid-rung (interior search is expensive) and
             // discard the partial. Rung 0 is cheap (branching quiesced evals)
-            // and runs atomically once entered, so it is never left partial.
+            // and the deadline never cuts it short once entered; it stops early
+            // only at a failed admitted answer (below), which ends the search.
             if iter_depth > 0 && services.deadline.expired() {
                 completed = false;
                 break;
@@ -4249,8 +4257,13 @@ fn run_iterative_deepening(
                     }
                     None => {
                         if unverified {
-                            failed_admitted_answer
-                                .get_or_insert_with(|| r.candidate.action.clone());
+                            // This beam is not the one `EachCandidate` builds and
+                            // the caller scores the decision again, so no answer
+                            // after this one is simulated or evaluated, and rung 0
+                            // is not accepted.
+                            failed_admitted_answer = Some(r.candidate.action.clone());
+                            completed = false;
+                            break;
                         }
                         // Action failed simulation — same penalty as origin/main so the
                         // AI prefers any valid alternative.
@@ -4264,10 +4277,11 @@ fn run_iterative_deepening(
         // "Fully completed" also requires the deadline to be live after the
         // LAST candidate: expiry mid-final-evaluation is invisible to the
         // per-candidate entry check and would accept a rung whose tail score
-        // was truncated. Rung 0 stays exempt (atomic once entered — it is the
-        // no-regression floor, == origin/main's deadline collapse). Node-budget
-        // exhaustion deliberately does NOT discard: the deepest rung consuming
-        // its full `max_nodes` reproduces origin/main's single fixed-depth pass.
+        // was truncated. Rung 0 stays exempt from this check (once entered, the
+        // deadline never cuts it short — it is the no-regression floor, ==
+        // origin/main's deadline collapse). Node-budget exhaustion deliberately
+        // does NOT discard: the deepest rung consuming its full `max_nodes`
+        // reproduces origin/main's single fixed-depth pass.
         let accepted = completed && (iter_depth == 0 || !services.deadline.expired());
 
         // D3: one witness per executed rung (completion + node headroom). A
@@ -15711,6 +15725,86 @@ mod tests {
             "a rejected candidate must not request a successor"
         );
         assert_eq!(out, vec![(cast.action, f64::NEG_INFINITY)]);
+    }
+
+    /// Under `PromptAnswerValidation::AtSubmission`, rung 0 stops at the first
+    /// beam answer the legality gate admitted without simulating it whose
+    /// simulation fails: it returns that answer, simulates (and so evaluates)
+    /// no beam answer after it, and records rung 0 as not completed. The board
+    /// is Luminescent Rain (its Oracle text verbatim) for a P0 at
+    /// `i32::MAX - 1` life controlling an Ally and an Elf, so those two types
+    /// fail and Advisor and Angel apply. The paired reach guard runs the same
+    /// beam under `EachCandidate`.
+    ///
+    /// Fails if rung 0 goes on past the failure, or reports a later failure.
+    #[test]
+    fn rung_zero_stops_at_the_first_admitted_answer_that_fails() {
+        let state = crate::planner::tests::luminescent_rain_prompt_rejecting(&["Ally", "Elf"]);
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        assert!(
+            matches!(config.search.planner_mode, PlannerMode::BeamPlusRollout)
+                && config.search.max_depth >= 2,
+            "fixture: the search deepens past rung 0"
+        );
+        let mut beam_only = config.clone();
+        beam_only.search.planner_mode = PlannerMode::BeamOnly; // rung 0 only
+        let ctx = build_decision_context(&state);
+        let choose = |choice: &str| GameAction::ChooseOption {
+            choice: choice.to_string(),
+        };
+        let row = |choice: &str| {
+            let action = choose(choice);
+            let candidate = ctx
+                .candidates
+                .iter()
+                .find(|candidate| candidate.action == action)
+                .cloned()
+                .unwrap_or_else(|| panic!("{choice} is offered"));
+            RankedCandidate::new(candidate, 0.0)
+        };
+        let beam = || vec![row("Advisor"), row("Ally"), row("Elf"), row("Angel")];
+        let rungs = |services: &PlannerServices<'_>| {
+            services
+                .rung_stats
+                .iter()
+                .map(|rung| (rung.depth, rung.completed))
+                .collect::<Vec<_>>()
+        };
+
+        // Paired reach guard: simulating every answer, rung 0 simulates the whole beam.
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &beam_only, PolicyRegistry::shared());
+        let scored = run_iterative_deepening(&state, beam(), 0.1, &beam_only, &mut services)
+            .expect("services that simulate every answer admit none unsimulated");
+        assert_eq!(scored.len(), 4, "reach guard: every beam answer is scored");
+        assert_eq!(
+            services.memo_witness.successor_simulations, 4,
+            "reach guard: the counter counts every beam answer rung 0 simulates"
+        );
+        assert_eq!(rungs(&services), [(0, true)]);
+
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        services.prompt_answers = PromptAnswerValidation::AtSubmission;
+        let Err(FailedAdmittedAnswer(failed)) =
+            run_iterative_deepening(&state, beam(), 0.1, &config, &mut services)
+        else {
+            panic!("an admitted beam answer that fails must be returned instead of scores");
+        };
+        assert_eq!(
+            *failed,
+            choose("Ally"),
+            "the first admitted answer that fails is returned"
+        );
+        assert_eq!(
+            services.memo_witness.successor_simulations, 2,
+            "rung 0 simulates Advisor and Ally, and no answer after Ally"
+        );
+        assert_eq!(
+            rungs(&services),
+            [(0, false)],
+            "rung 0 is recorded as not completed, and no later rung runs"
+        );
     }
 
     // V6: the rung witness records completion + node usage for every executed rung.

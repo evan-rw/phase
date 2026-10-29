@@ -1213,7 +1213,7 @@ impl<'a> PlannerServices<'a> {
             // its submission guard without mutating the game; the engine decides that
             // through the same authority `SimulationFilter` consults before its
             // probe. Under `PromptAnswerValidation::AtSubmission` no state copy is
-            // made here: the root search simulates the answers in its beam, and
+            // made here: the root search simulates the answers in its beam until one fails, and
             // the caller the one answer it submits. A shape
             // the authority declines (a scoped search, a card name, a free-entry
             // number, an answer given while a cast or activation is in progress),
@@ -1891,10 +1891,11 @@ pub(crate) enum PromptAnswerValidation {
     /// Simulate each answer on a state copy, as the gate's catch-all does. The
     /// gate's verdict is final.
     EachCandidate,
-    /// Admit the answer without a state copy. The root search simulates each
-    /// such answer in its beam on its first rung and, if one fails, returns it
-    /// (`search::FailedAdmittedAnswer`) instead of scores, and the root scorer
-    /// scores the decision again under `EachCandidate`. The caller must simulate
+    /// Admit the answer without a state copy. The root search simulates such
+    /// answers in its beam on its first rung, in beam order, and returns the
+    /// first that fails (`search::FailedAdmittedAnswer`) instead of scores,
+    /// simulating no answer after it, and the root scorer scores the decision
+    /// again under `EachCandidate`. The caller must simulate
     /// the one answer it submits ([`PlannerServices::simulation_accepts`]) and,
     /// if that simulation fails, decide again under `EachCandidate`. Only the
     /// canonical chooser (`search::choose_action_with_session_inner`) does
@@ -2230,7 +2231,7 @@ pub fn apply_candidate(state: &GameState, candidate: &CandidateAction) -> Option
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, TacticalClass};
     use engine::game::combat::BlockRequirement;
@@ -4576,6 +4577,10 @@ mod tests {
     /// seeded from it, as is a measurement-mode seat configuration.
     const AI_DECISION_SEED: u64 = 0;
 
+    /// A wall-clock budget no decision in these tests comes near (ten minutes):
+    /// a deadline started from it is still live when the decision ends.
+    const LIVE_TIME_BUDGET_MS: u32 = 600_000;
+
     /// [`run_ai_decision`] for a seat configured as `config`.
     fn run_ai_decision_with(prompt: &GameState, config: AiConfig) -> AiDecision {
         run_ai_decision_in(prompt, config, AiSession::arc_from_game(prompt))
@@ -4787,8 +4792,8 @@ mod tests {
     /// Each of those types would gain 2 life, a total outside that range, so
     /// its apply returns `EngineError::LifeChangeUnrepresentable`; every other
     /// type gains no life and applies. The five fill the Medium root beam, and
-    /// the root search's simulation of each fails, so the decision is scored
-    /// again with every type simulated before anything is selected. The AI
+    /// the root search's simulation of the first of them fails, so the decision
+    /// is scored again with every type simulated before anything is selected. The AI
     /// submits the type, and leaves its RNG where, the simulate-every-answer
     /// gate does, and the driver simulates that type once more before
     /// submitting it.
@@ -4900,7 +4905,8 @@ mod tests {
     /// range; CR 119.3 adjusts a life total by what is gained, and the rules set
     /// no maximum), and a type P0 controls no permanent of gains no life and
     /// applies.
-    fn luminescent_rain_prompt_rejecting(controlled: &[&str]) -> GameState {
+    /// `pub(crate)` so the root-search tests in `search.rs` build the same board.
+    pub(crate) fn luminescent_rain_prompt_rejecting(controlled: &[&str]) -> GameState {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
         scenario.with_life(P0, i32::MAX - 1);
@@ -4950,9 +4956,10 @@ mod tests {
     /// each gain life past the engine's range, so their applies fail; they
     /// outrank every other type and take four of the Medium beam's five places,
     /// and the fifth is a type P0 controls no permanent of, which applies. The
-    /// root search simulates the beam and finds the four rejected, so the
-    /// decision is scored again with every type simulated before anything is
-    /// selected: the AI submits the type, and leaves its RNG where, the
+    /// root search simulates the beam in order and stops at the first of the
+    /// four, which it finds rejected, so the decision is scored again with
+    /// every type simulated before anything is selected: the AI submits the
+    /// type, and leaves its RNG where, the
     /// simulate-every-answer gate does, whose beam holds five accepted types.
     ///
     /// Fails if only a selected answer that fails is replaced: the AI then
@@ -5085,9 +5092,10 @@ mod tests {
     /// the first five types in the stable action order (Advisor, Aetherborn, Alien,
     /// Ally, Angel). Ally's apply fails: 2 more life is outside the engine's range
     /// (CR 119.3 adjusts a life total by what is gained, and the rules set no
-    /// maximum). The root search's first rung simulates each admitted answer in its
-    /// beam although a policy rejects it, finds Ally rejected, and the decision is
-    /// scored again with every type simulated before anything is selected. That
+    /// maximum). The root search's first rung simulates the admitted answers in its
+    /// beam in order although a policy rejects them, stops at Ally, which it finds
+    /// rejected, and the decision is scored again with every type simulated before
+    /// anything is selected. That
     /// gate's beam (Advisor, Aetherborn, Alien, Angel, Antelope) is all −∞, so its
     /// selection takes no draw and falls back to the last row in the stable order,
     /// Antelope, which the driver simulates once more before submitting it.
@@ -5233,6 +5241,156 @@ mod tests {
         assert_eq!(
             decision.next_draw, draws[1],
             "the decision's first selection draws once, where that gate's selection draws none"
+        );
+        assert_eq!(seat(&decision.after, P0).life, i32::MAX - 1);
+        assert!(
+            decision.after.stack.is_empty(),
+            "Luminescent Rain must finish resolving"
+        );
+        assert!(
+            matches!(decision.after.waiting_for, WaitingFor::Priority { player } if player == P0),
+            "P0 must receive priority after Luminescent Rain resolves (CR 117.3b), got {:?}",
+            decision.after.waiting_for
+        );
+    }
+
+    /// Production path for the chooser's retake under a live wall-clock
+    /// deadline: the board and policy of
+    /// `ai_driver_without_search_replaces_a_rejected_type_it_selects`, decided
+    /// by an Easy seat, whose search is disabled, outside measurement mode and
+    /// under a budget no decision comes near. The type the selection takes is
+    /// one P0 controls, so its simulation fails and the chooser takes the
+    /// decision again under `EachCandidate`, a second scoring pass. That second
+    /// pass must run under the root-search deadline the first pass started.
+    ///
+    /// Fails if the chooser hands a pass a fresh `RootSearchDeadline`: the
+    /// second pass then starts a deadline of its own, at a later instant.
+    #[test]
+    fn ai_driver_retakes_a_decision_under_the_deadline_its_first_pass_started() {
+        const CONTROLLED: [&str; 5] = ["Elf", "Goblin", "Human", "Merfolk", "Zombie"];
+        let prompt = luminescent_rain_prompt_rejecting(&CONTROLLED);
+        let offered = named_options(&prompt).len() as u64;
+        let mut config = create_config_for_players(AiDifficulty::Easy, Platform::Native, 2);
+        config.search.time_budget_ms = Some(LIVE_TIME_BUDGET_MS);
+        assert!(
+            !config.execution_mode.is_measurement()
+                && !config.search.enabled
+                && PromptAnswerValidation::for_chooser(&config)
+                    == PromptAnswerValidation::AtSubmission,
+            "fixture: a seat under a wall-clock budget that scores without search and decides under `AtSubmission`"
+        );
+
+        crate::search::ROOT_SEARCH_DEADLINES.with_borrow_mut(Vec::clear);
+        let decision = run_ai_decision_in(
+            &prompt,
+            config,
+            session_scoring_with(
+                &prompt,
+                RejectsNamedChoices {
+                    except: &CONTROLLED,
+                },
+            ),
+        );
+        let deadlines = crate::search::ROOT_SEARCH_DEADLINES.take();
+
+        assert_eq!(
+            decision.clones,
+            offered + 1,
+            "reach guard: the selected type's simulation fails, then every offered type is simulated"
+        );
+        assert_eq!(
+            deadlines.len(),
+            2,
+            "reach guard: the decision is scored twice"
+        );
+        assert!(
+            deadlines[0].remaining().is_some(),
+            "reach guard: the first pass runs under a wall-clock deadline"
+        );
+        assert_eq!(
+            deadlines[1], deadlines[0],
+            "the retaken decision must run under the deadline its first pass started"
+        );
+        let GameAction::ChooseOption { choice } = &decision.action else {
+            panic!(
+                "the AI must answer the creature-type prompt, got {:?}",
+                decision.action
+            );
+        };
+        assert!(
+            !CONTROLLED.contains(&choice.as_str()),
+            "the AI must not submit a rejected type, got {choice}"
+        );
+        assert_eq!(seat(&decision.after, P0).life, i32::MAX - 1);
+        assert!(
+            decision.after.stack.is_empty(),
+            "Luminescent Rain must finish resolving"
+        );
+        assert!(
+            matches!(decision.after.waiting_for, WaitingFor::Priority { player } if player == P0),
+            "P0 must receive priority after Luminescent Rain resolves (CR 117.3b), got {:?}",
+            decision.after.waiting_for
+        );
+    }
+
+    /// Production path for the scorer's re-score under a live wall-clock
+    /// deadline: the board of
+    /// `ai_driver_replaces_a_submitted_creature_type_the_engine_rejects`,
+    /// decided by a Medium seat outside measurement mode and under a budget no
+    /// decision comes near. The root search's first rung finds a type of its
+    /// beam rejected, so the scorer scores the decision again under
+    /// `EachCandidate`, a second scoring pass. That second pass must run under
+    /// the root-search deadline the first pass started.
+    ///
+    /// Fails if the scorer hands its second pass a fresh `RootSearchDeadline`:
+    /// that pass then starts a deadline of its own, at a later instant.
+    #[test]
+    fn ai_driver_scores_again_under_the_deadline_its_root_search_started() {
+        const CONTROLLED: [&str; 5] = ["Elf", "Goblin", "Human", "Merfolk", "Zombie"];
+        let prompt = luminescent_rain_prompt_rejecting(&CONTROLLED);
+        let offered = named_options(&prompt).len() as u64;
+        let mut config = create_config_for_players(AiDifficulty::Medium, Platform::Native, 2);
+        config.search.time_budget_ms = Some(LIVE_TIME_BUDGET_MS);
+        assert!(
+            !config.execution_mode.is_measurement() && config.search.enabled,
+            "fixture: a searching seat under a wall-clock budget"
+        );
+
+        crate::search::ROOT_SEARCH_DEADLINES.with_borrow_mut(Vec::clear);
+        let decision = run_ai_decision_with(&prompt, config);
+        let deadlines = crate::search::ROOT_SEARCH_DEADLINES.take();
+
+        assert_eq!(
+            decision.clones,
+            offered + 1,
+            "reach guard: the decision is scored again with every offered type simulated, and the submitted one once more"
+        );
+        assert_eq!(
+            deadlines.len(),
+            2,
+            "reach guard: the decision is scored twice"
+        );
+        assert!(
+            deadlines[0].remaining().is_some(),
+            "reach guard: the first pass runs under a wall-clock deadline"
+        );
+        assert!(
+            !deadlines[0].expired(),
+            "reach guard: the deadline is still live, so the first pass's root search ran its first rung and caught a rejected type; the second pass is the scorer's"
+        );
+        assert_eq!(
+            deadlines[1], deadlines[0],
+            "the decision scored again must run under the deadline its first pass started"
+        );
+        let GameAction::ChooseOption { choice } = &decision.action else {
+            panic!(
+                "the AI must answer the creature-type prompt, got {:?}",
+                decision.action
+            );
+        };
+        assert!(
+            !CONTROLLED.contains(&choice.as_str()),
+            "the AI must not submit a rejected type, got {choice}"
         );
         assert_eq!(seat(&decision.after, P0).life, i32::MAX - 1);
         assert!(
