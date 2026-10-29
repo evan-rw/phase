@@ -45,7 +45,7 @@ use crate::features::DeckFeatures;
 use crate::plan::{PlanSnapshot, PlanState};
 use crate::planner::{
     prepare_payment_candidates, BeamContinuationPlanner, PlannerServices, PreparedCandidate,
-    RankedCandidate, RungStat, SearchBudget,
+    PromptAnswerValidation, RankedCandidate, RungStat, SearchBudget,
 };
 use crate::policies::context::{PolicyContext, SearchDepth};
 use crate::policies::copy_value::score_legend_rule_keep;
@@ -586,22 +586,47 @@ fn choose_action_with_session_inner(
         }
     }
 
-    let mut scored = score_candidates_uncertified(
-        &root_domain,
-        config,
-        session,
-        ensemble_deadline,
-        RootReuse::FromChooser {
-            contract,
-            priority_shortcut,
-        },
-    );
-    if durable_pact_routes {
-        draft_pact_routes_for_scored_actions(state, ai_player, &scored, session);
-    } else {
-        scored.retain(|(action, _)| !is_certified_pact_root(state, ai_player, action));
+    // The scored path, as one step this decision may take twice. Under
+    // `PromptAnswerValidation::AtSubmission` the legality gate admits
+    // named-choice answers and library search selections without simulating
+    // them, so the answer selected is simulated before anything commits it. If
+    // that simulation fails, the decision is taken again under `EachCandidate`,
+    // the gate that simulates every answer, from the same selection draw, so it
+    // selects what that gate selects.
+    let root = RootReuse::FromChooser {
+        contract,
+        priority_shortcut,
+    };
+    let mut draw = SelectionDraw::default();
+    let mut score_and_select = |prompt_answers: PromptAnswerValidation| {
+        let mut scored = score_candidates_uncertified(
+            &root_domain,
+            config,
+            session,
+            ensemble_deadline,
+            root,
+            prompt_answers,
+        );
+        if durable_pact_routes {
+            draft_pact_routes_for_scored_actions(state, ai_player, &scored, session);
+        } else {
+            scored.retain(|(action, _)| !is_certified_pact_root(state, ai_player, action));
+        }
+        // Issue #4878: total order before softmax so equal scores never depend on
+        // HashSet/HashMap allocation order.
+        scored.sort_by(|a, b| a.0.cmp_stable(&b.0));
+        let index = softmax_select_index_with(&scored, config.temperature, || draw.uniform(rng))?;
+        Some(ScoredPick { scored, index })
+    };
+    let prompt_answers = PromptAnswerValidation::for_chooser();
+    let mut pick = score_and_select(prompt_answers);
+    if pick.as_ref().is_some_and(|pick| {
+        prompt_answers.admits_without_simulation(state, pick.action())
+            && !PlannerServices::simulation_accepts(state, pick.action())
+    }) {
+        pick = score_and_select(PromptAnswerValidation::EachCandidate);
     }
-    if scored.is_empty() {
+    let Some(ScoredPick { scored, index }) = pick else {
         // No valid candidates from search — fall back to a safe escape action
         // so the game never deadlocks waiting for the AI.
         return direct(
@@ -612,25 +637,15 @@ fn choose_action_with_session_inner(
                 })
                 .filter(&in_contract),
         );
-    }
-    // Issue #4878: total order before softmax so equal scores never depend on
-    // HashSet/HashMap allocation order.
-    scored.sort_by(|a, b| a.0.cmp_stable(&b.0));
-    let chosen = if scored.len() == 1 {
-        Some((0, scored[0].0.clone()))
-    } else {
-        softmax_select_index(&scored, config.temperature, rng)
-            .map(|index| (index, scored[index].0.clone()))
     };
-    if let Some((_, action)) = &chosen {
-        arm_certified_fetch_prompt(action, ai_player, session);
-        if durable_pact_routes {
-            arm_certified_pact_route(state, action, ai_player, session);
-        }
-        emit_decision_trace(state, ai_player, config, action, session);
+    let chosen = scored[index].0.clone();
+    arm_certified_fetch_prompt(&chosen, ai_player, session);
+    if durable_pact_routes {
+        arm_certified_pact_route(state, &chosen, ai_player, session);
     }
-    let selected_index = chosen.as_ref().map(|(index, _)| *index);
-    let action = chosen.map(|(_, action)| action).filter(&in_contract);
+    emit_decision_trace(state, ai_player, config, &chosen, session);
+    let selected_index = Some(index);
+    let action = Some(chosen).filter(&in_contract);
     AiDecisionSelection {
         receipt: diagnostics
             .then(|| {
@@ -646,6 +661,32 @@ fn choose_action_with_session_inner(
             })
             .flatten(),
         action,
+    }
+}
+
+/// One selection of the chooser's scored path: the scored candidates in the
+/// selector's order and the index it selected.
+struct ScoredPick {
+    scored: Vec<(GameAction, f64)>,
+    index: usize,
+}
+
+impl ScoredPick {
+    fn action(&self) -> &GameAction {
+        &self.scored[self.index].0
+    }
+}
+
+/// A decision's one softmax draw from the caller's RNG: taken the first time a
+/// selection needs it and reused by a later selection of the same decision, so
+/// a decision that selects twice consumes no more of the caller's stream than
+/// its first selection did.
+#[derive(Default)]
+struct SelectionDraw(Option<f64>);
+
+impl SelectionDraw {
+    fn uniform(&mut self, rng: &mut impl Rng) -> f64 {
+        *self.0.get_or_insert_with(|| rng.random::<f64>())
     }
 }
 
@@ -2984,7 +3025,17 @@ pub(crate) fn score_candidates_with_session(
     if let Some(action) = certified_lethal_action(config, deadline, &root_domain, None) {
         return vec![(action, 1.0)];
     }
-    score_candidates_uncertified(&root_domain, config, session, deadline, RootReuse::Fresh)
+    // A score-only caller (the public scorer, a WASM pool worker) selects
+    // elsewhere and cannot simulate the answer it submits, so every prompt
+    // answer is simulated here.
+    score_candidates_uncertified(
+        &root_domain,
+        config,
+        session,
+        deadline,
+        RootReuse::Fresh,
+        PromptAnswerValidation::EachCandidate,
+    )
 }
 
 /// The ensemble's ONE shared wall-clock ceiling across all K sequential
@@ -3074,18 +3125,33 @@ fn score_candidates_uncertified(
     session: &Arc<AiSession>,
     deadline: engine::util::Deadline,
     root: RootReuse<'_>,
+    prompt_answers: PromptAnswerValidation,
 ) -> Vec<(GameAction, f64)> {
     let (state, ai_player) = (root_domain.state, root_domain.ai_player);
     // Attacker declarations are public-state tactical choices. Running K hidden
     // information samples cannot improve them, but would multiply the bounded
     // multiplayer comparison and make a singleton support drift.
     if matches!(state.waiting_for, WaitingFor::DeclareAttackers { .. }) {
-        return score_candidates_core_for_root(root_domain, config, session, None, root);
+        return score_candidates_core_for_root(
+            root_domain,
+            config,
+            session,
+            None,
+            root,
+            prompt_answers,
+        );
     }
     let k = config.search.determinization_samples;
     if k == 0 {
         // Unchanged path: no determinization, no shared-deadline override.
-        return score_candidates_core_for_root(root_domain, config, session, None, root);
+        return score_candidates_core_for_root(
+            root_domain,
+            config,
+            session,
+            None,
+            root,
+            prompt_answers,
+        );
     }
 
     let mut acc: Vec<(GameAction, f64)> = Vec::new();
@@ -3729,12 +3795,15 @@ fn score_candidates_core(
     session: &Arc<AiSession>,
     deadline_override: Option<engine::util::Deadline>,
 ) -> Vec<(GameAction, f64)> {
+    // A sampled world is not the decision state the chooser simulates its
+    // submitted answer on, so each world simulates every prompt answer itself.
     score_candidates_core_for_root(
         &RootPriorityDomain::new(state, ai_player),
         config,
         session,
         deadline_override,
         RootReuse::Fresh,
+        PromptAnswerValidation::EachCandidate,
     )
 }
 
@@ -3768,6 +3837,7 @@ fn score_candidates_core_for_root(
     session: &Arc<AiSession>,
     deadline_override: Option<engine::util::Deadline>,
     root: RootReuse<'_>,
+    prompt_answers: PromptAnswerValidation,
 ) -> Vec<(GameAction, f64)> {
     let (state, ai_player) = (domain.state, domain.ai_player);
     // The scored/parallel-worker path bypasses `choose_action_with_session_inner`.
@@ -3836,6 +3906,7 @@ fn score_candidates_core_for_root(
 
     let mut services =
         PlannerServices::with_deadline(ai_player, config, policies, context, deadline_override);
+    services.prompt_answers = prompt_answers;
 
     // Combat decisions bypass the candidate pipeline entirely — the combat AI
     // reads directly from game state and never uses generated candidates.
@@ -5346,6 +5417,17 @@ fn softmax_select_index(
     temperature: f64,
     rng: &mut impl Rng,
 ) -> Option<usize> {
+    softmax_select_index_with(scored, temperature, || rng.random::<f64>())
+}
+
+/// [`softmax_select_index`] with its uniform draw in `[0, 1)` taken from
+/// `uniform`, which runs at most once, and only when the pick is random: two or
+/// more rows whose weights have a finite, positive total.
+fn softmax_select_index_with(
+    scored: &[(GameAction, f64)],
+    temperature: f64,
+    uniform: impl FnOnce() -> f64,
+) -> Option<usize> {
     if scored.is_empty() {
         return None;
     }
@@ -5377,7 +5459,7 @@ fn softmax_select_index(
             .map(|(index, _)| index);
     }
 
-    let threshold: f64 = rng.random::<f64>() * total;
+    let threshold: f64 = uniform() * total;
     let mut cumulative = 0.0;
     for (i, w) in weights.iter().enumerate() {
         cumulative += w;
@@ -19314,6 +19396,7 @@ one on the bottom of your library.";
                 contract: &contract,
                 priority_shortcut: RootPriorityShortcut::Recompute,
             },
+            PromptAnswerValidation::EachCandidate,
         );
         assert!(
             scored
@@ -19402,6 +19485,7 @@ one on the bottom of your library.";
                 contract: &contract,
                 priority_shortcut: RootPriorityShortcut::Recompute,
             },
+            PromptAnswerValidation::EachCandidate,
         );
         assert_eq!(root_witnesses(), (0, 1));
         assert_eq!(score_bits(&recomputed), score_bits(&direct));
@@ -19426,6 +19510,7 @@ one on the bottom of your library.";
                     &session,
                     ensemble_deadline(&config),
                     root,
+                    PromptAnswerValidation::EachCandidate,
                 ))
             };
             let fresh = score(RootReuse::Fresh);
