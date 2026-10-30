@@ -36,7 +36,9 @@ use crate::features::mana_ramp::target_filter_references_land;
 use crate::policies::effect_classify::{
     effect_polarity, extract_target_filter, lethal_to_creature, EffectPolarity,
 };
-use crate::policies::stack_awareness::{damage_kills, node_damage, nodes_acting_on};
+use crate::policies::stack_awareness::{
+    chain_has_effect, damage_kills, is_damage, is_harmful, node_damage, nodes_acting_on,
+};
 
 /// Threat-level threshold above which protection casts/activations are unblocked.
 pub(crate) const THREAT_FLOOR: f64 = 0.45;
@@ -395,6 +397,10 @@ fn any_stack_harmful_answerable_by_grants(
         if entry.controller == ai_player {
             return false;
         }
+        // Only a harmful node is answered (`harmful_effect_answerable_by_grants`).
+        if !chain_has_effect(entry, is_harmful) {
+            return false;
+        }
         let declared_targets = entry
             .ability()
             .map(declared_targets_in_chain)
@@ -415,9 +421,8 @@ fn any_stack_harmful_answerable_by_grants(
                 }
                 // Whether the stack's damage kills the creature: `None` when a
                 // damage node's amount is not fixed.
-                let lethal = nodes_acting_on(state, *obj_id)
+                let lethal = nodes_acting_on(state, *obj_id, is_damage)
                     .iter()
-                    .filter(|other| matches!(other.node.effect, Effect::DealDamage { .. }))
                     .map(|other| node_damage(state, other.node, obj))
                     .collect::<Option<Vec<_>>>()
                     .map(|dealt| damage_kills(obj, &dealt, 0));
@@ -448,7 +453,7 @@ fn harmful_effect_answerable_by_grants(
     lethal: Option<bool>,
     declared_targets: &[TargetRef],
 ) -> bool {
-    if !matches!(effect_polarity(effect), EffectPolarity::Harmful) {
+    if !is_harmful(effect) {
         return false;
     }
     grants
@@ -2221,38 +2226,45 @@ mod tests {
         assert!(answerable(&runner));
     }
 
-    #[test]
-    fn prevention_is_judged_against_the_damage_of_every_stack_entry() {
-        use engine::game::effects::stack_reach::stack_entry_node_reach;
+    /// P1 casts two Shocks at P0's creature with toughness `toughness`, each
+    /// its own stack entry.
+    fn two_shocks_at_ai_creature(toughness: i32) -> (engine::game::scenario::GameRunner, ObjectId) {
         use engine::game::scenario::{GameScenario, P0, P1};
         use engine::types::game_state::WaitingFor;
         use engine::types::mana::{ManaColor, ManaCost};
-        // P1 casts two Shocks at P0's creature, each its own stack entry.
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let ai_creature = scenario.add_creature(P0, "Ai", 3, toughness).id();
+        let shocks: Vec<ObjectId> = (0..2)
+            .map(|_| {
+                scenario
+                    .add_spell_to_hand_from_oracle(P1, "Shock", true, SHOCK)
+                    .with_mana_cost(ManaCost::generic(1))
+                    .id()
+            })
+            .collect();
+        for _ in 0..2 {
+            scenario.add_basic_land(P1, ManaColor::Red);
+        }
+        let mut runner = scenario.build();
+        {
+            let state = runner.state_mut();
+            state.active_player = P1;
+            state.priority_player = P1;
+            state.waiting_for = WaitingFor::Priority { player: P1 };
+        }
+        for shock in shocks {
+            runner.cast(shock).target_object(ai_creature).commit();
+        }
+        (runner, ai_creature)
+    }
+
+    #[test]
+    fn prevention_is_judged_against_the_damage_of_every_stack_entry() {
+        use engine::game::effects::stack_reach::stack_entry_node_reach;
+        use engine::game::scenario::P0;
         for toughness in [3, 5] {
-            let mut scenario = GameScenario::new();
-            scenario.at_phase(Phase::PreCombatMain);
-            let ai_creature = scenario.add_creature(P0, "Ai", 3, toughness).id();
-            let shocks: Vec<ObjectId> = (0..2)
-                .map(|_| {
-                    scenario
-                        .add_spell_to_hand_from_oracle(P1, "Shock", true, SHOCK)
-                        .with_mana_cost(ManaCost::generic(1))
-                        .id()
-                })
-                .collect();
-            for _ in 0..2 {
-                scenario.add_basic_land(P1, ManaColor::Red);
-            }
-            let mut runner = scenario.build();
-            {
-                let state = runner.state_mut();
-                state.active_player = P1;
-                state.priority_player = P1;
-                state.waiting_for = WaitingFor::Priority { player: P1 };
-            }
-            for shock in shocks {
-                runner.cast(shock).target_object(ai_creature).commit();
-            }
+            let (runner, ai_creature) = two_shocks_at_ai_creature(toughness);
             let state = runner.state();
             assert!(
                 state.stack.len() == 2
@@ -2267,6 +2279,33 @@ mod tests {
                 any_stack_harmful_answerable_by_grants(state, P0, &[DefensiveGrant::PreventDamage]),
                 toughness == 3,
                 "4 damage kills a 3-toughness creature and not a 5-toughness one"
+            );
+        }
+    }
+
+    #[test]
+    fn prevention_is_judged_among_landfall_triggers_without_reading_their_reach() {
+        use crate::test_support::{reading_with_reach_count, with_landfall_triggers};
+        use engine::game::scenario::{P0, P1};
+        let answerable = |state: &GameState| {
+            any_stack_harmful_answerable_by_grants(state, P0, &[DefensiveGrant::PreventDamage])
+        };
+        for toughness in [3, 5] {
+            let (runner, _) = two_shocks_at_ai_creature(toughness);
+            let plain = runner.state();
+            // P1's landfall triggers below, between and above the two Shocks.
+            let landfall = with_landfall_triggers(plain, P1);
+            let (answer, builds) = reading_with_reach_count(|| answerable(plain));
+            assert_eq!(
+                answer,
+                toughness == 3,
+                "4 damage kills a 3-toughness creature and not a 5-toughness one"
+            );
+            assert!(builds > 0, "reach guard: the Shocks' reach is read");
+            assert_eq!(
+                reading_with_reach_count(|| answerable(&landfall)),
+                (answer, builds),
+                "the same answer, without reading the triggers' reach"
             );
         }
     }
