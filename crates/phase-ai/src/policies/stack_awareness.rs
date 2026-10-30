@@ -1899,8 +1899,11 @@ mod tests {
         }
     }
 
+    /// A predicate the stack readers pass to [`chain_has_effect`], with its name.
+    type NamedJudge = (&'static str, fn(&Effect) -> bool);
+
     /// The predicates the stack readers pass to [`chain_has_effect`], named.
-    const JUDGED: [(&str, fn(&Effect) -> bool); 5] = [
+    const JUDGED: [NamedJudge; 5] = [
         ("is_harmful", is_harmful),
         ("removes_or_damages", removes_or_damages),
         ("is_pump", is_pump),
