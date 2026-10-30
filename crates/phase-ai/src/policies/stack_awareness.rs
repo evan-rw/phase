@@ -2176,4 +2176,53 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn nodes_acting_on_reads_only_the_judged_nodes_that_act_on_the_object() {
+        use engine::types::ability::PtValue;
+        let mut state = make_state();
+        let victim = add_creature(&mut state, PlayerId(0), 2, 2);
+        let source = spell_object(&mut state, PlayerId(1), 1);
+        // A pump with damage below it, both aimed at the creature.
+        let mut root = ResolvedAbility::new(
+            Effect::Pump {
+                power: PtValue::Fixed(1),
+                toughness: PtValue::Fixed(1),
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(victim)],
+            source,
+            PlayerId(1),
+        );
+        root.sub_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 2 },
+                target: TargetFilter::Any,
+                damage_source: None,
+                excess: None,
+            },
+            vec![TargetRef::Object(victim)],
+            source,
+            PlayerId(1),
+        )));
+        let chain = push_chain(&mut state, PlayerId(1), root);
+        let entry = state.stack.iter().find(|e| e.id == chain).expect("chain");
+        let reaches = stack_entry_node_reach(&state, entry);
+        assert!(
+            reaches.len() == 2
+                && reaches
+                    .iter()
+                    .all(|reach| reach.acted_on == vec![TargetRef::Object(victim)]),
+            "reach guard: both nodes act on the creature"
+        );
+
+        let kinds = |judged: fn(&Effect) -> bool| -> Vec<EffectKind> {
+            nodes_acting_on(&state, victim, judged)
+                .iter()
+                .map(|reach| EffectKind::from(&reach.node.effect))
+                .collect()
+        };
+        assert_eq!(kinds(is_damage), vec![EffectKind::DealDamage]);
+        assert_eq!(kinds(is_pump), vec![EffectKind::Pump]);
+    }
 }
