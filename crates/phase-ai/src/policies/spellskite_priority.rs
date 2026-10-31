@@ -17,7 +17,7 @@ use engine::types::player::PlayerId;
 
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
-use super::stack_awareness::{can_be_destroyed, chain_has_effect, is_harmful};
+use super::stack_awareness::{can_be_destroyed, is_harmful, judged_reaches};
 use crate::features::DeckFeatures;
 
 fn reject(kind: &'static str) -> PolicyVerdict {
@@ -59,22 +59,18 @@ fn stack_has_redirectable_threat(
         let Some(ability) = entry.ability() else {
             return false;
         };
-        let harms_ai = chain_has_effect(entry, is_harmful)
-            && engine::game::effects::stack_reach::stack_entry_node_reach(state, entry)
-                .iter()
-                .any(|reach| {
-                    is_harmful(&reach.node.effect)
-                        && reach.acted_on.iter().any(|t| match t {
-                            TargetRef::Player(pid) => *pid == ai_player,
-                            TargetRef::Object(obj_id) => {
-                                state.objects.get(obj_id).is_some_and(|o| {
-                                    o.controller == ai_player
-                                        && (!matches!(reach.node.effect, Effect::Destroy { .. })
-                                            || can_be_destroyed(o))
-                                })
-                            }
-                        })
-                });
+        let harms_ai = judged_reaches(state, entry, is_harmful)
+            .iter()
+            .any(|reach| {
+                reach.acted_on.iter().any(|t| match t {
+                    TargetRef::Player(pid) => *pid == ai_player,
+                    TargetRef::Object(obj_id) => state.objects.get(obj_id).is_some_and(|o| {
+                        o.controller == ai_player
+                            && (!matches!(reach.node.effect, Effect::Destroy { .. })
+                                || can_be_destroyed(o))
+                    }),
+                })
+            });
         if !harms_ai {
             return false;
         }

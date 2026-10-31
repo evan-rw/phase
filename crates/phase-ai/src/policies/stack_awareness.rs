@@ -123,14 +123,7 @@ pub(crate) fn foreign_counter_target_of_ai(
     entry: &StackEntry,
     ai_player: PlayerId,
 ) -> Option<f64> {
-    if !chain_has_effect(entry, is_counter) {
-        return None;
-    }
-    let reaches = stack_entry_node_reach(state, entry);
-    let counters: Vec<&NodeReach<'_>> = reaches
-        .iter()
-        .filter(|reach| is_counter(&reach.node.effect))
-        .collect();
+    let counters = judged_reaches(state, entry, is_counter);
     if counters.is_empty() {
         return None;
     }
@@ -231,10 +224,9 @@ fn score_pump_response(ctx: &PolicyContext<'_>, target_id: ObjectId) -> f64 {
 
     let has_opponent_pump = ctx.state.stack.iter().any(|entry| {
         entry.controller != ctx.ai_player
-            && chain_has_effect(entry, is_pump)
-            && stack_entry_node_reach(ctx.state, entry)
+            && judged_reaches(ctx.state, entry, is_pump)
                 .iter()
-                .any(|reach| is_pump(&reach.node.effect) && acts_on(reach, target_id))
+                .any(|reach| acts_on(reach, target_id))
     });
 
     if has_opponent_pump {
@@ -320,13 +312,35 @@ fn acts_on(reach: &NodeReach<'_>, object: ObjectId) -> bool {
 /// its two children, `push_unanswered_below` pushes the nodes below a stop). So
 /// when this is false no node of the entry's reach is one `judged` accepts,
 /// and a reader that reads only such nodes skips the entry before building its
-/// reach.
+/// reach ([`judged_reaches`]).
 pub(crate) fn chain_has_effect(entry: &StackEntry, judged: fn(&Effect) -> bool) -> bool {
     entry.ability().is_some_and(|root| {
         collect_resolved_abilities(root)
             .into_iter()
             .any(|node| judged(&node.effect))
     })
+}
+
+/// The nodes of `entry`'s reach ([`stack_entry_node_reach`]) whose effect
+/// `judged` accepts, in reach order. When no node of the entry's chain has
+/// such an effect ([`chain_has_effect`]) the answer is empty and the reach is
+/// not built: every reach node is a node of that chain.
+///
+/// The one place a stack reader pairs its chain prefilter with its node
+/// filter, so the entries a reader skips and the nodes it reads are decided
+/// by the same predicate.
+pub(crate) fn judged_reaches<'a>(
+    state: &GameState,
+    entry: &'a StackEntry,
+    judged: fn(&Effect) -> bool,
+) -> Vec<NodeReach<'a>> {
+    if !chain_has_effect(entry, judged) {
+        return Vec::new();
+    }
+    stack_entry_node_reach(state, entry)
+        .into_iter()
+        .filter(|reach| judged(&reach.node.effect))
+        .collect()
 }
 
 /// A harmful effect ([`effect_polarity`]): the nodes [`has_pending_removal`],
@@ -389,16 +403,15 @@ pub(crate) fn removal_steps_acting_on(
         .collect()
 }
 
-/// Whether `object` is a creature permanent `player` controls: a creature on
-/// the battlefield (CR 109.2 + CR 110.1) that is phased in. A phased-out
+/// Whether `object` is a creature permanent `player` controls: a creature that
+/// is a phased-in permanent ([`GameObject::is_phased_in_permanent`], the
+/// engine's existence test for a permanent: CR 109.2 + CR 110.1). A phased-out
 /// permanent is treated as though it does not exist and is not on the
 /// battlefield (CR 702.26b + CR 702.26d), and a card that left the battlefield
 /// is a new object (CR 400.7), so neither is a creature a pump or a protective
-/// grant can reach. Mirrors the engine's own existence test for a permanent
-/// (`targeting::is_phased_in_battlefield_permanent`, crate-private).
+/// grant can reach.
 pub(crate) fn is_creature_permanent_controlled_by(object: &GameObject, player: PlayerId) -> bool {
-    object.zone == Zone::Battlefield
-        && object.is_phased_in()
+    object.is_phased_in_permanent()
         && object.controller == player
         && object.card_types.core_types.contains(&CoreType::Creature)
 }
@@ -422,16 +435,16 @@ pub(crate) fn is_damage(effect: &Effect) -> bool {
 /// Whether another stack entry has a harmful node that acts on this object
 /// ([`stack_entry_node_reach`]). An entry is not its own pending removal: a
 /// spell that exiles itself does so only by resolving. An entry with no
-/// harmful node ([`chain_has_effect`]) is skipped before its reach is built.
+/// harmful node ([`judged_reaches`]) is skipped before its reach is built.
 pub(crate) fn has_pending_removal(state: &GameState, target_id: ObjectId) -> bool {
     state
         .stack
         .iter()
-        .filter(|entry| entry.id != target_id && chain_has_effect(entry, is_harmful))
+        .filter(|entry| entry.id != target_id)
         .any(|entry| {
-            stack_entry_node_reach(state, entry)
+            judged_reaches(state, entry, is_harmful)
                 .iter()
-                .any(|reach| acts_on(reach, target_id) && is_harmful(&reach.node.effect))
+                .any(|reach| acts_on(reach, target_id))
         })
 }
 
@@ -480,7 +493,7 @@ pub(crate) fn can_be_destroyed(object: &GameObject) -> bool {
 /// `object_id`, in the order the entries resolve (CR 405.5: the top one first).
 ///
 /// A caller passes every effect its walk acts on. An entry with no such node
-/// ([`chain_has_effect`]) is skipped before its reach is built, and leaving
+/// ([`judged_reaches`]) is skipped before its reach is built, and leaving
 /// out the other nodes keeps the order of the rest.
 pub(crate) fn nodes_acting_on(
     state: &GameState,
@@ -491,9 +504,9 @@ pub(crate) fn nodes_acting_on(
         .stack
         .iter()
         .rev()
-        .filter(|entry| entry.id != object_id && chain_has_effect(entry, judged))
-        .flat_map(|entry| stack_entry_node_reach(state, entry))
-        .filter(|reach| judged(&reach.node.effect) && acts_on(reach, object_id))
+        .filter(|entry| entry.id != object_id)
+        .flat_map(|entry| judged_reaches(state, entry, judged))
+        .filter(|reach| acts_on(reach, object_id))
         .collect()
 }
 
@@ -2231,12 +2244,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn nodes_acting_on_reads_only_the_judged_nodes_that_act_on_the_object() {
+    /// P1 casts a pump with damage below it, both aimed at P0's 2/2 creature.
+    /// Returns the creature and the chain's stack entry id.
+    fn pump_with_damage_below(state: &mut GameState) -> (ObjectId, ObjectId) {
         use engine::types::ability::PtValue;
-        let mut state = make_state();
-        let victim = add_creature(&mut state, PlayerId(0), 2, 2);
-        let source = spell_object(&mut state, PlayerId(1), 1);
+        let victim = add_creature(state, PlayerId(0), 2, 2);
+        let source = spell_object(state, PlayerId(1), 1);
         // A pump with damage below it, both aimed at the creature.
         let mut root = ResolvedAbility::new(
             Effect::Pump {
@@ -2259,7 +2272,14 @@ mod tests {
             source,
             PlayerId(1),
         )));
-        let chain = push_chain(&mut state, PlayerId(1), root);
+        let chain = push_chain(state, PlayerId(1), root);
+        (victim, chain)
+    }
+
+    #[test]
+    fn nodes_acting_on_reads_only_the_judged_nodes_that_act_on_the_object() {
+        let mut state = make_state();
+        let (victim, chain) = pump_with_damage_below(&mut state);
         let entry = state.stack.iter().find(|e| e.id == chain).expect("chain");
         let reaches = stack_entry_node_reach(&state, entry);
         assert!(
@@ -2278,6 +2298,31 @@ mod tests {
         };
         assert_eq!(kinds(is_damage), vec![EffectKind::DealDamage]);
         assert_eq!(kinds(is_pump), vec![EffectKind::Pump]);
+    }
+
+    #[test]
+    fn judged_reaches_reads_only_the_judged_nodes_of_an_entry_whose_chain_has_one() {
+        use crate::test_support::reading_with_reach_count;
+        let mut state = make_state();
+        let (_, chain) = pump_with_damage_below(&mut state);
+        let entry = state.stack.iter().find(|e| e.id == chain).expect("chain");
+        assert_eq!(
+            stack_entry_node_reach(&state, entry).len(),
+            2,
+            "reach guard: the reach has the pump and the damage"
+        );
+        let kinds = |judged: fn(&Effect) -> bool| {
+            reading_with_reach_count(|| {
+                judged_reaches(&state, entry, judged)
+                    .iter()
+                    .map(|reach| EffectKind::from(&reach.node.effect))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(kinds(is_damage), (vec![EffectKind::DealDamage], 1));
+        assert_eq!(kinds(is_pump), (vec![EffectKind::Pump], 1));
+        // No counter in the chain: nothing, and the reach is not built.
+        assert_eq!(kinds(is_counter), (Vec::new(), 0));
     }
 
     #[test]

@@ -36,7 +36,7 @@ use crate::policies::effect_classify::{
     effect_polarity, extract_target_filter, lethal_to_creature, EffectPolarity,
 };
 use crate::policies::stack_awareness::{
-    chain_has_effect, damage_kills, is_creature_permanent_controlled_by, is_damage, is_harmful,
+    damage_kills, is_creature_permanent_controlled_by, is_damage, is_harmful, judged_reaches,
     node_damage, nodes_acting_on,
 };
 
@@ -397,16 +397,18 @@ fn any_stack_harmful_answerable_by_grants(
         if entry.controller == ai_player {
             return false;
         }
-        // Only a harmful node is answered (`harmful_effect_answerable_by_grants`).
-        if !chain_has_effect(entry, is_harmful) {
+        // Only a harmful node is answered (`harmful_effect_answerable_by_grants`),
+        // so only the harmful nodes are read: an entry without one is skipped
+        // before its reach is built.
+        let harmful = judged_reaches(state, entry, is_harmful);
+        if harmful.is_empty() {
             return false;
         }
         let declared_targets = entry
             .ability()
             .map(declared_targets_in_chain)
             .unwrap_or_default();
-        let reaches = engine::game::effects::stack_reach::stack_entry_node_reach(state, entry);
-        reaches.iter().any(|reach| {
+        harmful.iter().any(|reach| {
             reach.acted_on.iter().any(|t| {
                 let TargetRef::Object(obj_id) = t else {
                     return false;
@@ -445,6 +447,9 @@ fn any_stack_harmful_answerable_by_grants(
 /// `effect`. A prevention grant answers damage unless `lethal` says the damage
 /// does not kill `protected`. `declared_targets` are the targets of the stack
 /// entry `effect` belongs to.
+/// Its caller passes only harmful nodes
+/// ([`judged_reaches`](crate::policies::stack_awareness::judged_reaches)); the
+/// guard keeps the predicate's own contract.
 fn harmful_effect_answerable_by_grants(
     state: &GameState,
     effect: &Effect,
