@@ -26,7 +26,6 @@ use engine::game::functioning_abilities::active_static_definitions;
 use engine::game::keywords::{object_has_effective_keyword_kind, source_matches_protection_target};
 use engine::game::targeting::find_legal_targets;
 use engine::types::ability::TargetRef;
-use engine::types::card_type::CoreType;
 use engine::types::keywords::{HexproofFilter, KeywordKind, ProtectionTarget};
 
 use crate::ability_chain::collect_chain_effects;
@@ -37,7 +36,8 @@ use crate::policies::effect_classify::{
     effect_polarity, extract_target_filter, lethal_to_creature, EffectPolarity,
 };
 use crate::policies::stack_awareness::{
-    chain_has_effect, damage_kills, is_damage, is_harmful, node_damage, nodes_acting_on,
+    chain_has_effect, damage_kills, is_creature_permanent_controlled_by, is_damage, is_harmful,
+    node_damage, nodes_acting_on,
 };
 
 /// Threat-level threshold above which protection casts/activations are unblocked.
@@ -414,9 +414,10 @@ fn any_stack_harmful_answerable_by_grants(
                 let Some(obj) = state.objects.get(obj_id) else {
                     return false;
                 };
-                if obj.controller != ai_player
-                    || !obj.card_types.core_types.contains(&CoreType::Creature)
-                {
+                // CR 109.2 + CR 400.7 + CR 702.26b: a grant reaches only a
+                // creature permanent the AI controls, not the card of one that
+                // left the battlefield or one that is phased out.
+                if !is_creature_permanent_controlled_by(obj, ai_player) {
                     return false;
                 }
                 // Whether the stack's damage kills the creature: `None` when a
@@ -1255,6 +1256,7 @@ fn ability_grants_combat_step_protection(ability: &AbilityDefinition) -> bool {
 mod tests {
     use super::*;
     use engine::types::ability::{AbilityKind, ControllerRef, TypedFilter};
+    use engine::types::card_type::CoreType;
     use engine::types::keywords::ProtectionTarget;
 
     fn grant_effect(
@@ -2587,6 +2589,46 @@ mod tests {
             Zone::Battlefield,
             "engine: protection from red prevents it"
         );
+    }
+
+    #[test]
+    fn a_grant_does_not_answer_damage_to_a_phased_out_ai_creature() {
+        use engine::game::effects::stack_reach::stack_entry_node_reach;
+        use engine::game::game_object::PhaseOutCause;
+        use engine::game::phasing::phase_out_object;
+        use engine::game::scenario::P0;
+        use engine::types::mana::ManaColor;
+        let (mut runner, ai_creature) = ghyrson_starn_trigger_at_the_ai_creature();
+        let red = [DefensiveGrant::Protection(ProtectionTarget::Color(
+            ManaColor::Red,
+        ))];
+        assert!(
+            any_stack_harmful_answerable_by_grants(runner.state(), P0, &red),
+            "control: protection from red answers the trigger's damage to the phased-in creature"
+        );
+        // The creature phases out with the trigger waiting, as an effect
+        // that phases it out does.
+        assert_eq!(
+            phase_out_object(
+                runner.state_mut(),
+                ai_creature,
+                PhaseOutCause::Directly,
+                &mut Vec::new()
+            ),
+            vec![ai_creature],
+            "reach guard: the creature phased out"
+        );
+        let state = runner.state();
+        let entry = state.stack.back().expect("Ghyrson Starn's trigger");
+        assert!(
+            stack_entry_node_reach(state, entry)
+                .iter()
+                .any(|reach| reach.acted_on == vec![TargetRef::Object(ai_creature)]),
+            "reach guard: the trigger still acts on the phased-out creature"
+        );
+        // CR 702.26b: a phased-out creature is treated as though it does not
+        // exist, so no grant reaches it.
+        assert!(!any_stack_harmful_answerable_by_grants(state, P0, &red));
     }
 
     #[test]

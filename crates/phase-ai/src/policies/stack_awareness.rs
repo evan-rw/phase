@@ -336,18 +336,71 @@ pub(crate) fn is_harmful(effect: &Effect) -> bool {
     matches!(effect_polarity(effect), EffectPolarity::Harmful)
 }
 
-/// Every effect the walks in [`will_target_die_from_stack`] and
-/// `tactical_gate::pump_can_save_from_hostile_stack` act on; an arm added to
-/// either walk must be added here.
+/// What a node that acts on an object does to it, as the walks in
+/// [`will_target_die_from_stack`] and
+/// `tactical_gate::pump_can_save_from_hostile_stack` read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemovalStep {
+    /// CR 701.8a: destroys it.
+    Destroy,
+    /// CR 701.6a: counters it.
+    Counter,
+    /// Returns it to a hand or the zone the bounce names.
+    Bounce,
+    /// Moves it to `destination`.
+    ChangeZone { destination: Zone },
+    /// CR 120.3: deals damage to it.
+    Damage,
+}
+
+/// The [`RemovalStep`] a node with `effect` takes, or `None` for an effect
+/// neither walk acts on. Both walks match on this, and
+/// [`removes_or_damages`] is whether it answers a step, so the entries and
+/// nodes their prefilter skips are exactly those neither walk reads.
+pub(crate) fn removal_step(effect: &Effect) -> Option<RemovalStep> {
+    match effect {
+        Effect::Destroy { .. } => Some(RemovalStep::Destroy),
+        Effect::Counter { .. } => Some(RemovalStep::Counter),
+        Effect::Bounce { .. } => Some(RemovalStep::Bounce),
+        Effect::ChangeZone { destination, .. } => Some(RemovalStep::ChangeZone {
+            destination: *destination,
+        }),
+        Effect::DealDamage { .. } => Some(RemovalStep::Damage),
+        _ => None,
+    }
+}
+
+/// Whether `effect` takes a [`RemovalStep`]: the nodes the walks in
+/// [`will_target_die_from_stack`] and
+/// `tactical_gate::pump_can_save_from_hostile_stack` read.
 pub(crate) fn removes_or_damages(effect: &Effect) -> bool {
-    matches!(
-        effect,
-        Effect::Destroy { .. }
-            | Effect::Counter { .. }
-            | Effect::Bounce { .. }
-            | Effect::ChangeZone { .. }
-            | Effect::DealDamage { .. }
-    )
+    removal_step(effect).is_some()
+}
+
+/// The [`RemovalStep`] of each node that acts on `object_id`, with the node,
+/// in the order the entries resolve ([`nodes_acting_on`]).
+pub(crate) fn removal_steps_acting_on(
+    state: &GameState,
+    object_id: ObjectId,
+) -> Vec<(RemovalStep, NodeReach<'_>)> {
+    nodes_acting_on(state, object_id, removes_or_damages)
+        .into_iter()
+        .filter_map(|reach| removal_step(&reach.node.effect).map(|step| (step, reach)))
+        .collect()
+}
+
+/// Whether `object` is a creature permanent `player` controls: a creature on
+/// the battlefield (CR 109.2 + CR 110.1) that is phased in. A phased-out
+/// permanent is treated as though it does not exist and is not on the
+/// battlefield (CR 702.26b + CR 702.26d), and a card that left the battlefield
+/// is a new object (CR 400.7), so neither is a creature a pump or a protective
+/// grant can reach. Mirrors the engine's own existence test for a permanent
+/// (`targeting::is_phased_in_battlefield_permanent`, crate-private).
+pub(crate) fn is_creature_permanent_controlled_by(object: &GameObject, player: PlayerId) -> bool {
+    object.zone == Zone::Battlefield
+        && object.is_phased_in()
+        && object.controller == player
+        && object.card_types.core_types.contains(&CoreType::Creature)
 }
 
 /// The effects [`score_pump_response`] reads: a pump of power and toughness.
@@ -390,26 +443,27 @@ pub(crate) fn will_target_die_from_stack(state: &GameState, target_id: ObjectId)
 
     let mut dealt = Vec::new();
 
-    for reach in nodes_acting_on(state, target_id, removes_or_damages) {
-        match &reach.node.effect {
+    for (step, reach) in removal_steps_acting_on(state, target_id) {
+        match step {
             // Destroy is lethal unless target is indestructible
-            Effect::Destroy { .. } if can_be_destroyed(object) => {
+            RemovalStep::Destroy if can_be_destroyed(object) => {
                 return true;
             }
             // Counter removes the spell from the stack. CR 101.2: unless
             // it can't be countered.
-            Effect::Counter { .. } if spell_can_be_countered(state, target_id) => return true,
+            RemovalStep::Counter if spell_can_be_countered(state, target_id) => return true,
             // Bounce removes from battlefield
-            Effect::Bounce { .. } => return true,
+            RemovalStep::Bounce => return true,
             // ChangeZone to non-battlefield removes from battlefield
-            Effect::ChangeZone {
+            RemovalStep::ChangeZone {
                 destination: Zone::Exile | Zone::Graveyard | Zone::Hand | Zone::Library,
-                ..
             } => {
                 return true;
             }
-            Effect::DealDamage { .. } => dealt.extend(node_damage(state, reach.node, object)),
-            _ => {}
+            RemovalStep::Damage => dealt.extend(node_damage(state, reach.node, object)),
+            // An indestructible object, a spell that can't be countered and a
+            // move to another zone: the read goes on.
+            RemovalStep::Destroy | RemovalStep::Counter | RemovalStep::ChangeZone { .. } => {}
         }
     }
 
@@ -2224,5 +2278,48 @@ mod tests {
         };
         assert_eq!(kinds(is_damage), vec![EffectKind::DealDamage]);
         assert_eq!(kinds(is_pump), vec![EffectKind::Pump]);
+    }
+
+    #[test]
+    fn removal_step_names_what_each_effect_the_walks_read_does() {
+        use engine::parser::oracle::parse_oracle_text;
+        for (name, text, card_type, step) in [
+            (
+                "Murder",
+                "Destroy target creature.",
+                "Instant",
+                Some(RemovalStep::Destroy),
+            ),
+            ("Cancel", CANCEL, "Instant", Some(RemovalStep::Counter)),
+            (
+                "Unsummon",
+                "Return target creature to its owner's hand.",
+                "Instant",
+                Some(RemovalStep::Bounce),
+            ),
+            (
+                "Cremate",
+                "Exile target card from a graveyard.\nDraw a card.",
+                "Instant",
+                Some(RemovalStep::ChangeZone {
+                    destination: Zone::Exile,
+                }),
+            ),
+            (
+                "Zombify",
+                "Return target creature card from your graveyard to the battlefield.",
+                "Sorcery",
+                Some(RemovalStep::ChangeZone {
+                    destination: Zone::Battlefield,
+                }),
+            ),
+            ("Shock", SHOCK, "Instant", Some(RemovalStep::Damage)),
+            ("Giant Growth", GIANT_GROWTH, "Instant", None),
+        ] {
+            let parsed = parse_oracle_text(text, name, &[], &[card_type.to_string()], &[]);
+            let effect = &parsed.abilities[0].effect;
+            assert_eq!(removal_step(effect), step, "{name}");
+            assert_eq!(removes_or_damages(effect), step.is_some(), "{name}");
+        }
     }
 }

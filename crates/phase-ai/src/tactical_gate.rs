@@ -69,8 +69,9 @@ use crate::policies::effect_classify::{
     effect_polarity, extract_target_filter, targets_creatures_only, EffectPolarity,
 };
 use crate::policies::stack_awareness::{
-    can_be_destroyed, chain_has_effect, damage_kills, has_pending_removal, node_damage,
-    nodes_acting_on, removes_or_damages, will_target_die_from_stack,
+    can_be_destroyed, chain_has_effect, damage_kills, has_pending_removal,
+    is_creature_permanent_controlled_by, node_damage, removal_steps_acting_on, removes_or_damages,
+    will_target_die_from_stack, RemovalStep,
 };
 use crate::policies::strategy_helpers::can_pay_ward_cost;
 use crate::search::ability_is_temporary_combat_modifier;
@@ -2012,42 +2013,35 @@ fn should_reject_pump_window(
 /// dying.
 ///
 /// The nodes acting on the creature are read in the order they resolve
-/// ([`nodes_acting_on`]) up to the first `Destroy`, `Counter`, `Bounce` or
+/// ([`removal_steps_acting_on`]) up to the first `Destroy`, `Counter`, `Bounce` or
 /// `ChangeZone` node, where a `Destroy` counts only if it can destroy the
 /// creature ([`can_be_destroyed`]). A `Destroy` or `Counter` there answers
 /// false: a pump does not stop it. A `Bounce` or `ChangeZone` there ends the
 /// read: damage that resolves after it does not reach the creature (CR 400.7),
 /// so only the damage before it is judged.
 ///
-/// Only the AI's creatures on the battlefield are judged: a pump's "target
-/// creature" is a creature permanent (CR 109.2), and a creature card that left
-/// the battlefield is a new object (CR 400.7) that no pump reaches.
+/// Only the AI's creature permanents are judged
+/// ([`is_creature_permanent_controlled_by`]): a pump's "target creature" is a
+/// creature permanent (CR 109.2). A creature card that left the battlefield is
+/// a new object (CR 400.7), and a phased-out creature is treated as though it
+/// does not exist (CR 702.26b), so no pump reaches either.
 fn pump_can_save_from_hostile_stack(
     state: &GameState,
     ai_player: PlayerId,
     toughness_bonus: i32,
 ) -> bool {
-    // CR 109.2 + CR 400.7: a pump's "target creature" is a creature permanent
-    // on the battlefield; a creature card that left the battlefield is a new
-    // object, so a pump cannot save it.
-    let ai_creature = |object: &engine::game::game_object::GameObject| {
-        object.zone == Zone::Battlefield
-            && object.controller == ai_player
-            && object.card_types.core_types.contains(&CoreType::Creature)
-    };
     // The answer for an AI creature that only entries without a
     // `removes_or_damages` node act on: the walk below reads no node for it,
     // so only the damage already marked on it is judged. While no AI creature
-    // on the battlefield answers true this way, such an entry cannot change
-    // the result, so its reach is not built; when one does, every entry's
-    // reach is read. One answers true only while it carries lethal marked
-    // damage, which CR 704.5g destroys before any player gets priority
-    // (CR 117.5), so in practice the guard is off. It is on only where the
-    // engine's state-based actions leave such a creature, for example a
-    // phased-out creature (CR 702.26b) or a check stopped at its iteration
-    // cap.
+    // permanent answers true this way, such an entry cannot change the
+    // result, so its reach is not built; when one does, every entry's reach
+    // is read. One answers true only while it carries lethal marked damage,
+    // which CR 704.5g destroys before any player gets priority (CR 117.5), so
+    // in practice the guard is off. It is on only where the engine's
+    // state-based actions leave such a creature on the battlefield phased in:
+    // a check stopped at its iteration cap.
     let already_saved = state.objects.values().any(|object| {
-        ai_creature(object)
+        is_creature_permanent_controlled_by(object, ai_player)
             && damage_kills(object, &[], 0)
             && !damage_kills(object, &[], toughness_bonus)
     });
@@ -2069,21 +2063,23 @@ fn pump_can_save_from_hostile_stack(
         let Some(object) = state.objects.get(object_id) else {
             return false;
         };
-        if !ai_creature(object) {
+        if !is_creature_permanent_controlled_by(object, ai_player) {
             return false;
         }
 
         let mut dealt = Vec::new();
-        for reach in nodes_acting_on(state, *object_id, removes_or_damages) {
-            match &reach.node.effect {
-                Effect::Destroy { .. } if can_be_destroyed(object) => return false,
-                Effect::Counter { .. } => return false,
-                Effect::Bounce { .. } | Effect::ChangeZone { .. } => break,
+        for (step, reach) in removal_steps_acting_on(state, *object_id) {
+            match step {
+                RemovalStep::Destroy if can_be_destroyed(object) => return false,
+                RemovalStep::Counter => return false,
+                RemovalStep::Bounce | RemovalStep::ChangeZone { .. } => break,
                 // Damage whose amount is not fixed is not judged.
-                Effect::DealDamage { .. } => {
+                RemovalStep::Damage => {
                     dealt.extend(node_damage(state, reach.node, object));
                 }
-                _ => {}
+                // CR 702.12b: a Destroy that cannot destroy the creature; the
+                // read goes on.
+                RemovalStep::Destroy => {}
             }
         }
         // The pump saves the creature only from damage that kills it without
@@ -11870,5 +11866,122 @@ mod tests {
             "every entry's reach is read while the creature carries lethal damage \
              ({landfall_builds} vs {builds})"
         );
+    }
+
+    const GHYRSON_STARN: &str = "Ward {2} (Whenever this creature becomes the target of a spell or ability an opponent controls, counter it unless that player pays {2}.)\nThree Autostubs — Whenever another source you control deals exactly 1 damage to a permanent or player, Ghyrson Starn deals 2 damage to that permanent or player.";
+    const HORNET_STING: &str = "Hornet Sting deals 1 damage to any target.";
+    const REALITY_RIPPLE: &str = "Target artifact, creature, or land phases out. (While it's phased out, it's treated as though it doesn't exist. It phases in before its controller untaps during their next untap step.)";
+
+    #[test]
+    fn a_pump_cannot_save_a_phased_out_ai_creature() {
+        use crate::test_support::{reading_with_reach_count, with_landfall_triggers};
+        for lethal in [false, true] {
+            // P1's Hornet Sting deals 1 damage to P0's 3/3 and P1's Ghyrson
+            // Starn triggers on it.
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let victim = scenario.add_creature(P0, "Victim", 3, 3).id();
+            // A legal target for the Giant Growth that nothing acts on.
+            scenario.add_creature(P0, "Bystander", 2, 2);
+            scenario
+                .add_creature(P1, "Ghyrson Starn, Kelermorph", 3, 2)
+                .from_oracle_text_with_keywords(&["Three Autostubs", "Ward"], GHYRSON_STARN);
+            let sting = scenario
+                .add_spell_to_hand_from_oracle(P1, "Hornet Sting", true, HORNET_STING)
+                .with_mana_cost(ManaCost::zero())
+                .id();
+            let ripple = scenario
+                .add_spell_to_hand_from_oracle(P0, "Reality Ripple", true, REALITY_RIPPLE)
+                .with_mana_cost(ManaCost::zero())
+                .id();
+            let growth = scenario
+                .add_spell_to_hand_from_oracle(P0, "Giant Growth", true, GIANT_GROWTH)
+                .with_mana_cost(ManaCost::zero())
+                .id();
+            let mut runner = scenario.build();
+            cast_at(&mut runner, P1, sting, victim);
+            for _ in 0..4 {
+                if runner.state().stack.back().is_some_and(|entry| {
+                    matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                }) {
+                    break;
+                }
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("P1 and P0 pass priority");
+            }
+            let trigger_acts_on_victim = |board: &GameState| {
+                let entry = board.stack.back().expect("Ghyrson Starn's trigger");
+                matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                    && entry.controller == P1
+                    && chain_has_effect(entry, removes_or_damages)
+                    && engine::game::effects::stack_reach::stack_entry_node_reach(board, entry)
+                        .iter()
+                        .any(|reach| reach.acted_on == vec![TargetRef::Object(victim)])
+            };
+            // Control: phased in, the 3/3 dies to the trigger's 2 damage on
+            // top of the Sting's 1 (CR 704.5g), and +3 toughness outlasts it.
+            let phased_in = runner.state().clone();
+            assert!(
+                trigger_acts_on_victim(&phased_in),
+                "reach guard: P1's trigger acts on the 3/3"
+            );
+            assert!(pump_can_save_from_hostile_stack(&phased_in, P0, 3));
+            assert_ne!(
+                gate_cast(&mut phased_in.clone(), growth),
+                GateDecision::Reject,
+                "the pump saves the phased-in 3/3"
+            );
+            // P0's Reality Ripple phases the 3/3 out with the trigger waiting.
+            cast_at(&mut runner, P0, ripple, victim);
+            runner.resolve_top();
+            if lethal {
+                // Lethal damage marked on the phased-out 3/3.
+                runner
+                    .state_mut()
+                    .objects
+                    .get_mut(&victim)
+                    .expect("the 3/3")
+                    .damage_marked = 3;
+            }
+            let board = runner.state().clone();
+            let creature = &board.objects[&victim];
+            assert!(
+                creature.zone == Zone::Battlefield
+                    && !creature.is_phased_in()
+                    && creature.controller == P0
+                    && creature.card_types.core_types.contains(&CoreType::Creature)
+                    && damage_kills(creature, &[], 0) == lethal
+                    && !damage_kills(creature, &[], 3),
+                "reach guard: the AI's phased-out 3/3 (lethal damage marked: {lethal})"
+            );
+            assert!(
+                trigger_acts_on_victim(&board),
+                "reach guard: the trigger still acts on the phased-out 3/3"
+            );
+            let (answer, builds) =
+                reading_with_reach_count(|| pump_can_save_from_hostile_stack(&board, P0, 3));
+            // CR 702.26b: a phased-out creature is treated as though it does
+            // not exist, so no pump saves it.
+            assert!(!answer, "lethal {lethal}");
+            assert!(builds > 0, "reach guard: the trigger's reach is read");
+            assert_eq!(
+                reading_with_reach_count(|| pump_can_save_from_hostile_stack(
+                    &with_landfall_triggers(&board, P1),
+                    P0,
+                    3
+                )),
+                (false, builds),
+                "the triggers' reach is not read (lethal {lethal})"
+            );
+            // Nothing of the AI's on the battlefield is threatened and there
+            // is no combat, so the gate's pump-window rule rejects a +3/+3
+            // that ends at cleanup.
+            assert_eq!(
+                gate_cast(&mut board.clone(), growth),
+                GateDecision::Reject,
+                "lethal {lethal}"
+            );
+        }
     }
 }
