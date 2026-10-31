@@ -448,8 +448,8 @@ fn any_stack_harmful_answerable_by_grants(
 /// does not kill `protected`. `declared_targets` are the targets of the stack
 /// entry `effect` belongs to.
 /// Its caller passes only harmful nodes
-/// ([`judged_reaches`](crate::policies::stack_awareness::judged_reaches)); the
-/// guard keeps the predicate's own contract.
+/// ([`judged_reaches`](crate::policies::stack_awareness::judged_reaches)); its
+/// own `is_harmful` check keeps that contract without relying on the caller.
 fn harmful_effect_answerable_by_grants(
     state: &GameState,
     effect: &Effect,

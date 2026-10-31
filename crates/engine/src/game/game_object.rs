@@ -3921,8 +3921,8 @@ impl GameObject {
     /// on the battlefield and phased in. Phasing does not move a permanent
     /// (CR 702.26d), so on the battlefield this is exactly the negation of
     /// [`Self::is_phased_out_permanent`], and in any other zone neither holds.
-    /// `pub` so `phase-ai` asks the engine which objects are permanents instead
-    /// of re-deriving it.
+    /// `pub` so `phase-ai` asks the engine which objects are phased-in
+    /// permanents instead of re-deriving it.
     pub fn is_phased_in_permanent(&self) -> bool {
         self.zone == Zone::Battlefield && self.is_phased_in()
     }
